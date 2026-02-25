@@ -918,6 +918,9 @@ function App() {
           <button type="button" onClick={newJourney} disabled={busy}>
             New
           </button>
+          <button type="button" className="danger" onClick={deleteJourney} disabled={busy}>
+            Delete Journey
+          </button>
           <button type="button" onClick={() => saveJourney('draft')} disabled={busy}>
             Save Draft
           </button>
