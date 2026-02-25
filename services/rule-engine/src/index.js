@@ -18,7 +18,8 @@ const emailDryRun = String(process.env.EMAIL_DRY_RUN || 'true').toLowerCase() ==
 
 const kafka = new Kafka({ clientId: 'eventra-rule-engine', brokers: kafkaBrokers });
 const admin = kafka.admin();
-const consumer = kafka.consumer({ groupId: 'eventra-rule-engine-v2' });
+const consumerGroupId = process.env.RULE_ENGINE_CONSUMER_GROUP || 'eventra-rule-engine-v2';
+const consumer = kafka.consumer({ groupId: consumerGroupId });
 const producer = kafka.producer({
   createPartitioner: Partitioners.LegacyPartitioner
 });
@@ -35,16 +36,102 @@ const mailTransporter =
 
 let runtimeJourneys = [];
 
-async function resolveCustomerEmail(customerId) {
+async function logInstanceTransition({
+  instanceId,
+  journeyId,
+  journeyVersion,
+  customerId,
+  fromState,
+  toState,
+  fromNode,
+  toNode,
+  reason,
+  eventId,
+  metadata = {}
+}) {
+  await pgClient.query(
+    `insert into journey_instance_transitions
+      (id, instance_id, journey_id, journey_version, customer_id, from_state, to_state, from_node, to_node, reason, event_id, metadata_json)
+     values
+      ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [
+      crypto.randomUUID(),
+      instanceId,
+      journeyId,
+      journeyVersion,
+      customerId,
+      fromState || null,
+      toState,
+      fromNode || null,
+      toNode || null,
+      reason || null,
+      eventId || null,
+      metadata
+    ]
+  );
+}
+
+async function markEventConsumed(eventId) {
+  if (!eventId) {
+    return true;
+  }
+
   const result = await pgClient.query(
-    `select attributes->>'email' as email
-     from customer_profiles
-     where customer_id = $1
-     limit 1`,
-    [customerId]
+    `insert into consumed_events (consumer_group, event_id)
+     values ($1, $2)
+     on conflict (consumer_group, event_id) do nothing
+     returning event_id`,
+    [consumerGroupId, eventId]
+  );
+  return result.rowCount > 0;
+}
+
+async function pushToDlq({ rawPayload, errorMessage, parsedEvent }) {
+  const item = {
+    id: crypto.randomUUID(),
+    event_id: parsedEvent?.event_id || null,
+    customer_id: parsedEvent?.customer_id || null,
+    event_type: parsedEvent?.event_type || null,
+    source_topic: 'event.raw',
+    error_message: String(errorMessage || 'unknown_error'),
+    raw_payload: rawPayload ? parseJsonSafe(rawPayload, { raw: rawPayload }) : null
+  };
+
+  await pgClient.query(
+    `insert into event_dlq
+      (id, event_id, customer_id, event_type, source_topic, error_message, raw_payload)
+     values ($1, $2, $3, $4, $5, $6, $7)`,
+    [item.id, item.event_id, item.customer_id, item.event_type, item.source_topic, item.error_message, item.raw_payload]
   );
 
-  return result.rows[0]?.email || null;
+  await producer.send({
+    topic: 'event.dlq',
+    messages: [{ key: item.customer_id || item.event_id || item.id, value: JSON.stringify(item) }]
+  });
+}
+
+function resolveEmailFromEventPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const directEmail = typeof payload.email === 'string' ? payload.email.trim() : '';
+  if (directEmail) {
+    return directEmail;
+  }
+
+  const toEmail = typeof payload.to === 'string' ? payload.to.trim() : '';
+  if (toEmail) {
+    return toEmail;
+  }
+
+  const nestedCustomerEmail =
+    typeof payload.customer?.email === 'string' ? payload.customer.email.trim() : '';
+  if (nestedCustomerEmail) {
+    return nestedCustomerEmail;
+  }
+
+  return null;
 }
 
 async function trySendEmail({ to, subject, text }) {
@@ -109,6 +196,22 @@ function getEdgeDelayMinutes(edge) {
   const raw = Number(edge?.data?.delay_minutes);
   if (Number.isFinite(raw) && raw >= 0) {
     return raw;
+  }
+  return 0;
+}
+
+function getEdgeMaxCustomersTotal(edge) {
+  const raw = Number(edge?.data?.max_customers_total);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.floor(raw);
+  }
+  return 0;
+}
+
+function getEdgeMaxCustomersPerDay(edge) {
+  const raw = Number(edge?.data?.max_customers_per_day);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.floor(raw);
   }
   return 0;
 }
@@ -352,6 +455,49 @@ async function isRateLimited(route, journey, customerId) {
   return (result.rows[0]?.cnt || 0) >= limit;
 }
 
+async function reserveEdgeCapacity(route, journey) {
+  const totalLimit = Number(route?.max_customers_total || 0);
+  const dailyLimit = Number(route?.max_customers_per_day || 0);
+  if ((!Number.isFinite(totalLimit) || totalLimit <= 0) && (!Number.isFinite(dailyLimit) || dailyLimit <= 0)) {
+    return { ok: true };
+  }
+
+  const reserve = async (windowType, windowStart, limit) => {
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return true;
+    }
+    const result = await pgClient.query(
+      `insert into edge_capacity_usage
+        (journey_id, journey_version, edge_id, window_type, window_start, used_count, updated_at)
+       values ($1, $2, $3, $4, $5, 1, now())
+       on conflict (journey_id, journey_version, edge_id, window_type, window_start)
+       do update set
+         used_count = edge_capacity_usage.used_count + 1,
+         updated_at = now()
+       where edge_capacity_usage.used_count < $6
+       returning used_count`,
+      [journey.journey_id, journey.version, route.edge_id, windowType, windowStart, limit]
+    );
+    return result.rowCount > 0;
+  };
+
+  if (Number.isFinite(totalLimit) && totalLimit > 0) {
+    const totalOk = await reserve('total', '1970-01-01T00:00:00Z', totalLimit);
+    if (!totalOk) {
+      return { ok: false, reason: 'edge_capacity_total_full' };
+    }
+  }
+
+  if (Number.isFinite(dailyLimit) && dailyLimit > 0) {
+    const dailyOk = await reserve('day', new Date().toISOString().slice(0, 10), dailyLimit);
+    if (!dailyOk) {
+      return { ok: false, reason: 'edge_capacity_daily_full' };
+    }
+  }
+
+  return { ok: true };
+}
+
 function findFirstActionNodeId(startNodeId, nodeMap, outgoingEdges) {
   if (!startNodeId || !nodeMap.has(startNodeId)) {
     return null;
@@ -429,6 +575,7 @@ function normalizeJourneyDefinition(row) {
   const waitNode = pathNodes.find((node) => getNodeKind(node) === 'wait') || null;
   const httpCallNode = pathNodes.find((node) => getNodeKind(node) === 'http_call') || null;
   const conditionNode = pathNodes.find((node) => getNodeKind(node) === 'condition') || null;
+  const routeDecisionNodeId = conditionNode?.id || httpCallNode?.id || waitNode?.id || triggerNode.id;
 
   let defaultActionNodeId =
     pathNodes.find((node) => getNodeKind(node) === 'action')?.id ||
@@ -442,8 +589,9 @@ function normalizeJourneyDefinition(row) {
   let timeoutRoutes = [];
   let errorRoutes = [];
 
+  const decisionEdges = outgoingEdges.get(routeDecisionNodeId) || [];
   if (conditionNode) {
-    const conditionEdges = outgoingEdges.get(conditionNode.id) || [];
+    const conditionEdges = decisionEdges;
     trueRoutes = conditionEdges
       .filter((edge) => getEdgeType(edge) === 'true')
       .map((edge) => ({
@@ -453,6 +601,8 @@ function normalizeJourneyDefinition(row) {
         delay_minutes: getEdgeDelayMinutes(edge),
         expression: String(edge?.data?.expression || '').trim(),
         rate_limit_per_day: Number(edge?.data?.rate_limit_per_day || 0),
+        max_customers_total: getEdgeMaxCustomersTotal(edge),
+        max_customers_per_day: getEdgeMaxCustomersPerDay(edge),
         action_node_id: findFirstActionNodeId(edge.target, nodeMap, outgoingEdges)
       }))
       .filter((route) => route.action_node_id);
@@ -466,6 +616,8 @@ function normalizeJourneyDefinition(row) {
         delay_minutes: getEdgeDelayMinutes(edge),
         expression: String(edge?.data?.expression || '').trim(),
         rate_limit_per_day: Number(edge?.data?.rate_limit_per_day || 0),
+        max_customers_total: getEdgeMaxCustomersTotal(edge),
+        max_customers_per_day: getEdgeMaxCustomersPerDay(edge),
         action_node_id: findFirstActionNodeId(edge.target, nodeMap, outgoingEdges)
       }))
       .filter((route) => route.action_node_id);
@@ -479,6 +631,8 @@ function normalizeJourneyDefinition(row) {
         delay_minutes: getEdgeDelayMinutes(edge),
         expression: String(edge?.data?.expression || '').trim(),
         rate_limit_per_day: Number(edge?.data?.rate_limit_per_day || 0),
+        max_customers_total: getEdgeMaxCustomersTotal(edge),
+        max_customers_per_day: getEdgeMaxCustomersPerDay(edge),
         action_node_id: findFirstActionNodeId(edge.target, nodeMap, outgoingEdges)
       }))
       .filter((route) => route.action_node_id);
@@ -492,6 +646,8 @@ function normalizeJourneyDefinition(row) {
         delay_minutes: getEdgeDelayMinutes(edge),
         expression: String(edge?.data?.expression || '').trim(),
         rate_limit_per_day: Number(edge?.data?.rate_limit_per_day || 0),
+        max_customers_total: getEdgeMaxCustomersTotal(edge),
+        max_customers_per_day: getEdgeMaxCustomersPerDay(edge),
         action_node_id: findFirstActionNodeId(edge.target, nodeMap, outgoingEdges)
       }))
       .filter((route) => route.action_node_id);
@@ -505,6 +661,8 @@ function normalizeJourneyDefinition(row) {
         delay_minutes: getEdgeDelayMinutes(edge),
         expression: String(edge?.data?.expression || '').trim(),
         rate_limit_per_day: Number(edge?.data?.rate_limit_per_day || 0),
+        max_customers_total: getEdgeMaxCustomersTotal(edge),
+        max_customers_per_day: getEdgeMaxCustomersPerDay(edge),
         action_node_id: findFirstActionNodeId(edge.target, nodeMap, outgoingEdges)
       }))
       .filter((route) => route.action_node_id);
@@ -519,6 +677,20 @@ function normalizeJourneyDefinition(row) {
     if (!defaultActionNodeId) {
       defaultActionNodeId = actionOnFalseNodeId || actionOnTrueNodeId;
     }
+  } else {
+    alwaysRoutes = decisionEdges
+      .map((edge) => ({
+        edge_id: edge.id,
+        edge_type: getEdgeType(edge),
+        priority: getEdgePriority(edge),
+        delay_minutes: getEdgeDelayMinutes(edge),
+        expression: String(edge?.data?.expression || '').trim(),
+        rate_limit_per_day: Number(edge?.data?.rate_limit_per_day || 0),
+        max_customers_total: getEdgeMaxCustomersTotal(edge),
+        max_customers_per_day: getEdgeMaxCustomersPerDay(edge),
+        action_node_id: findFirstActionNodeId(edge.target, nodeMap, outgoingEdges)
+      }))
+      .filter((route) => route.action_node_id);
   }
 
   if (!defaultActionNodeId && !actionOnTrueNodeId && !actionOnFalseNodeId) {
@@ -610,6 +782,18 @@ async function ensureSchema() {
       payload jsonb not null,
       source text not null
     )
+  `);
+  await pgClient.query(`
+    create index if not exists idx_events_customer_type_ts
+      on events (customer_id, event_type, ts desc)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_events_customer_ts
+      on events (customer_id, ts desc)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_events_ts_brin
+      on events using brin (ts)
   `);
 
   await pgClient.query(`
@@ -724,11 +908,99 @@ async function ensureSchema() {
     create index if not exists idx_journey_instances_due
       on journey_instances (state, due_at)
   `);
+
+  await pgClient.query(`
+    create index if not exists idx_journey_instances_journey_state_due
+      on journey_instances (journey_id, state, due_at)
+  `);
+
+  await pgClient.query(`
+    create index if not exists idx_journey_instances_customer_updated
+      on journey_instances (customer_id, updated_at desc)
+  `);
+
+  await pgClient.query(`
+    create index if not exists idx_journey_instances_updated
+      on journey_instances (updated_at desc)
+  `);
+
+  await pgClient.query(`
+    create table if not exists event_dlq (
+      id text primary key,
+      event_id text,
+      customer_id text,
+      event_type text,
+      source_topic text not null,
+      error_message text not null,
+      raw_payload jsonb,
+      created_at timestamptz not null default now()
+    )
+  `);
+
+  await pgClient.query(`
+    create index if not exists idx_event_dlq_created
+      on event_dlq (created_at desc)
+  `);
+
+  await pgClient.query(`
+    create table if not exists journey_instance_transitions (
+      id text primary key,
+      instance_id text not null,
+      journey_id text not null,
+      journey_version int not null,
+      customer_id text not null,
+      from_state text,
+      to_state text not null,
+      from_node text,
+      to_node text,
+      reason text,
+      event_id text,
+      metadata_json jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now()
+    )
+  `);
+
+  await pgClient.query(`
+    create index if not exists idx_instance_transitions_lookup
+      on journey_instance_transitions (instance_id, created_at desc)
+  `);
+
+  await pgClient.query(`
+    create index if not exists idx_instance_transitions_customer
+      on journey_instance_transitions (customer_id, created_at desc)
+  `);
+
+  await pgClient.query(`
+    create table if not exists consumed_events (
+      consumer_group text not null,
+      event_id text not null,
+      consumed_at timestamptz not null default now(),
+      primary key (consumer_group, event_id)
+    )
+  `);
+
+  await pgClient.query(`
+    create table if not exists edge_capacity_usage (
+      journey_id text not null,
+      journey_version int not null,
+      edge_id text not null,
+      window_type text not null,
+      window_start timestamptz not null,
+      used_count int not null default 0,
+      updated_at timestamptz not null default now(),
+      primary key (journey_id, journey_version, edge_id, window_type, window_start)
+    )
+  `);
+
+  await pgClient.query(`
+    create index if not exists idx_edge_capacity_lookup
+      on edge_capacity_usage (journey_id, journey_version, edge_id, window_type, window_start desc)
+  `);
 }
 
 async function createOrReplaceWaitingInstance(journey, event) {
   const existing = await pgClient.query(
-    `select instance_id
+    `select instance_id, state, current_node, journey_version
      from journey_instances
      where journey_id = $1 and customer_id = $2 and state in ('waiting', 'active', 'processing')
      limit 1`,
@@ -736,6 +1008,7 @@ async function createOrReplaceWaitingInstance(journey, event) {
   );
 
   if (existing.rowCount > 0) {
+    const current = existing.rows[0];
     await pgClient.query(
       `update journey_instances
        set state = 'waiting',
@@ -752,20 +1025,34 @@ async function createOrReplaceWaitingInstance(journey, event) {
         event.ts,
         journey.wait_minutes,
         event.event_id,
-        existing.rows[0].instance_id,
+        current.instance_id,
         journey.wait_node_id
       ]
     );
+    await logInstanceTransition({
+      instanceId: current.instance_id,
+      journeyId: journey.journey_id,
+      journeyVersion: current.journey_version || journey.version,
+      customerId: event.customer_id,
+      fromState: current.state,
+      toState: 'waiting',
+      fromNode: current.current_node,
+      toNode: journey.wait_node_id,
+      reason: 'trigger_event_replace_wait',
+      eventId: event.event_id,
+      metadata: { trigger_event_type: event.event_type, wait_minutes: journey.wait_minutes }
+    });
     return;
   }
 
+  const newInstanceId = crypto.randomUUID();
   await pgClient.query(
     `insert into journey_instances
       (instance_id, journey_id, journey_version, customer_id, state, current_node, started_at, due_at, last_event_id, context_json)
      values
       ($1, $2, $3, $4, 'waiting', $5, $6, $6::timestamptz + make_interval(mins => $7), $8, $9)`,
     [
-      crypto.randomUUID(),
+      newInstanceId,
       journey.journey_id,
       journey.version,
       event.customer_id,
@@ -781,6 +1068,20 @@ async function createOrReplaceWaitingInstance(journey, event) {
       })
     ]
   );
+
+  await logInstanceTransition({
+    instanceId: newInstanceId,
+    journeyId: journey.journey_id,
+    journeyVersion: journey.version,
+    customerId: event.customer_id,
+    fromState: null,
+    toState: 'waiting',
+    fromNode: null,
+    toNode: journey.wait_node_id,
+    reason: 'trigger_event_new_instance',
+    eventId: event.event_id,
+    metadata: { trigger_event_type: event.event_type, wait_minutes: journey.wait_minutes }
+  });
 }
 
 async function processEvent(event) {
@@ -807,12 +1108,26 @@ async function evaluateDueJourney(journey) {
      set state = 'processing', updated_at = now()
      from due
      where ji.instance_id = due.instance_id
-     returning ji.instance_id, ji.customer_id, ji.started_at, ji.last_event_id, ji.context_json`,
+     returning ji.instance_id, ji.customer_id, ji.started_at, ji.last_event_id, ji.context_json,
+               ji.state as to_state, 'waiting'::text as from_state, ji.current_node, ji.journey_version`,
     [journey.journey_id]
   );
 
   for (const instance of claimed.rows) {
     try {
+      await logInstanceTransition({
+        instanceId: instance.instance_id,
+        journeyId: journey.journey_id,
+        journeyVersion: instance.journey_version || journey.version,
+        customerId: instance.customer_id,
+        fromState: instance.from_state,
+        toState: instance.to_state,
+        fromNode: instance.current_node,
+        toNode: instance.current_node,
+        reason: 'due_claimed_for_processing',
+        eventId: instance.last_event_id
+      });
+
       let conditionMatched = false;
       if (
         journey.condition_node_id &&
@@ -857,8 +1172,9 @@ async function evaluateDueJourney(journey) {
          limit 1`,
         [instance.customer_id]
       );
+      const triggerPayload = triggerEventResult.rows[0]?.payload || {};
       const expressionContext = {
-        payload: triggerEventResult.rows[0]?.payload || {},
+        payload: triggerPayload,
         attributes: profileResult.rows[0]?.attributes || {},
         external: {}
       };
@@ -907,9 +1223,15 @@ async function evaluateDueJourney(journey) {
       const timeoutRoutes = journey.condition_routes?.timeout_routes || [];
       const errorRoutes = journey.condition_routes?.error_routes || [];
 
-      const filterAllowedRoutes = async (routes) => {
-        const allowed = [];
-        for (const route of routes) {
+      const pickAllowedRouteWithCapacity = async (routes) => {
+        const sorted = [...routes].sort((a, b) => {
+          if (a.priority !== b.priority) {
+            return a.priority - b.priority;
+          }
+          return String(a.edge_id || '').localeCompare(String(b.edge_id || ''));
+        });
+
+        for (const route of sorted) {
           if (!evaluateSimpleExpression(route.expression, expressionContext)) {
             continue;
           }
@@ -917,31 +1239,35 @@ async function evaluateDueJourney(journey) {
           if (blocked) {
             continue;
           }
-          allowed.push(route);
+          const reserved = await reserveEdgeCapacity(route, journey);
+          if (!reserved.ok) {
+            continue;
+          }
+          return route;
         }
-        return allowed;
-      };
 
-      const trueCandidates = await filterAllowedRoutes([...trueRoutes, ...alwaysRoutes]);
-      const falseCandidates = await filterAllowedRoutes([...falseRoutes, ...alwaysRoutes]);
-      const timeoutCandidates = await filterAllowedRoutes([...timeoutRoutes, ...alwaysRoutes]);
-      const errorCandidates = await filterAllowedRoutes([...errorRoutes, ...alwaysRoutes]);
+        return null;
+      };
 
       let selectedRoute = null;
       if (journey.condition_node_id) {
         if (httpResult?.type === 'timeout') {
-          selectedRoute = pickBestRoute(timeoutCandidates);
+          selectedRoute = await pickAllowedRouteWithCapacity([...timeoutRoutes, ...alwaysRoutes]);
         } else if (httpResult?.type === 'error') {
-          selectedRoute = pickBestRoute(errorCandidates);
+          selectedRoute = await pickAllowedRouteWithCapacity([...errorRoutes, ...alwaysRoutes]);
         } else {
-          selectedRoute = conditionMatched ? pickBestRoute(trueCandidates) : pickBestRoute(falseCandidates);
+          selectedRoute = conditionMatched
+            ? await pickAllowedRouteWithCapacity([...trueRoutes, ...alwaysRoutes])
+            : await pickAllowedRouteWithCapacity([...falseRoutes, ...alwaysRoutes]);
         }
+      } else {
+        selectedRoute = await pickAllowedRouteWithCapacity(alwaysRoutes);
       }
 
-      let selectedActionNodeId = selectedRoute?.action_node_id || journey.default_action_node_id;
+      let selectedActionNodeId = selectedRoute?.action_node_id || null;
       let selectedDelayMinutes = selectedRoute?.delay_minutes || 0;
 
-      if (!selectedActionNodeId) {
+      if (!selectedActionNodeId && !journey.condition_node_id && alwaysRoutes.length === 0) {
         selectedActionNodeId = journey.default_action_node_id;
       }
 
@@ -977,6 +1303,19 @@ async function evaluateDueJourney(journey) {
             })
           ]
         );
+        await logInstanceTransition({
+          instanceId: instance.instance_id,
+          journeyId: journey.journey_id,
+          journeyVersion: instance.journey_version || journey.version,
+          customerId: instance.customer_id,
+          fromState: 'processing',
+          toState: 'waiting',
+          fromNode: instance.current_node,
+          toNode: selectedActionNodeId,
+          reason: 'edge_delay_wait',
+          eventId: instance.last_event_id,
+          metadata: { delay_minutes: selectedDelayMinutes }
+        });
         continue;
       }
 
@@ -998,6 +1337,18 @@ async function evaluateDueJourney(journey) {
             })
           ]
         );
+        await logInstanceTransition({
+          instanceId: instance.instance_id,
+          journeyId: journey.journey_id,
+          journeyVersion: instance.journey_version || journey.version,
+          customerId: instance.customer_id,
+          fromState: 'processing',
+          toState: 'completed',
+          fromNode: instance.current_node,
+          toNode: 'end',
+          reason: conditionMatched ? 'condition_true_no_action_path' : 'condition_false_no_action_path',
+          eventId: instance.last_event_id
+        });
         continue;
       }
 
@@ -1016,7 +1367,7 @@ async function evaluateDueJourney(journey) {
         };
 
         if (action.channel === 'email') {
-          const email = await resolveCustomerEmail(action.customer_id);
+          const email = resolveEmailFromEventPayload(triggerPayload);
           const sendResult = await trySendEmail({
             to: email,
             subject: action.message || `${journey.journey_id} notification`,
@@ -1059,8 +1410,7 @@ async function evaluateDueJourney(journey) {
       let finalRoute = selectedRoute;
 
       if (finalAction.status === 'failed' && errorRoutes.length > 0) {
-        const failureErrorCandidates = await filterAllowedRoutes(errorRoutes);
-        const errorRoute = pickBestRoute(failureErrorCandidates);
+        const errorRoute = await pickAllowedRouteWithCapacity(errorRoutes);
         const errorNodeId = errorRoute?.action_node_id || null;
         const errorConfig = errorNodeId ? journey.action_node_map?.[errorNodeId] || null : null;
 
@@ -1119,6 +1469,32 @@ async function evaluateDueJourney(journey) {
             })
           ]
         );
+      await logInstanceTransition({
+        instanceId: instance.instance_id,
+        journeyId: journey.journey_id,
+        journeyVersion: instance.journey_version || journey.version,
+        customerId: instance.customer_id,
+        fromState: 'processing',
+        toState: 'completed',
+        fromNode: instance.current_node,
+        toNode: finalActionNodeId,
+        reason:
+          finalAction.status === 'failed'
+            ? 'action_failed'
+            : httpResult?.type === 'timeout'
+              ? 'http_timeout_action'
+              : httpResult?.type === 'error'
+                ? 'http_error_action'
+                : conditionMatched
+                  ? 'condition_true_action'
+                  : 'condition_false_action',
+        eventId: instance.last_event_id,
+        metadata: {
+          http_type: httpResult?.type || null,
+          http_status: Number(httpResult?.status || 0),
+          route_edge_id: finalRoute?.edge_id || null
+        }
+      });
     } catch (error) {
       console.error('Due journey processing failed:', error.message);
       await pgClient.query(
@@ -1127,6 +1503,19 @@ async function evaluateDueJourney(journey) {
          where instance_id = $1`,
         [instance.instance_id]
       );
+      await logInstanceTransition({
+        instanceId: instance.instance_id,
+        journeyId: journey.journey_id,
+        journeyVersion: instance.journey_version || journey.version,
+        customerId: instance.customer_id,
+        fromState: 'processing',
+        toState: 'waiting',
+        fromNode: instance.current_node,
+        toNode: instance.current_node,
+        reason: 'processing_error_requeue',
+        eventId: instance.last_event_id,
+        metadata: { error: error.message }
+      });
     }
   }
 }
@@ -1142,7 +1531,7 @@ async function ensureKafkaTopics() {
   await admin.connect();
   try {
     const existingTopics = new Set(await admin.listTopics());
-    const missingTopics = ['event.raw', 'action.triggered'].filter(
+    const missingTopics = ['event.raw', 'action.triggered', 'event.dlq'].filter(
       (topic) => !existingTopics.has(topic)
     );
 
@@ -1188,9 +1577,28 @@ async function run() {
         return;
       }
 
-      const event = JSON.parse(raw);
-      await refreshRuntimeJourneys();
-      await processEvent(event);
+      let parsedEvent = null;
+      try {
+        parsedEvent = JSON.parse(raw);
+        const isNew = await markEventConsumed(parsedEvent.event_id);
+        if (!isNew) {
+          return;
+        }
+
+        await refreshRuntimeJourneys();
+        await processEvent(parsedEvent);
+      } catch (error) {
+        console.error('Event consume failed, pushed to DLQ:', error.message);
+        try {
+          await pushToDlq({
+            rawPayload: raw,
+            errorMessage: error.message,
+            parsedEvent
+          });
+        } catch (dlqError) {
+          console.error('DLQ write failed:', dlqError.message);
+        }
+      }
     }
   });
 

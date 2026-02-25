@@ -95,6 +95,12 @@ function normalizeEdgeMeta(edge = {}) {
   const rateLimitPerDay = Number.isFinite(Number(currentData.rate_limit_per_day))
     ? Number(currentData.rate_limit_per_day)
     : 0;
+  const maxCustomersTotal = Number.isFinite(Number(currentData.max_customers_total))
+    ? Number(currentData.max_customers_total)
+    : 0;
+  const maxCustomersPerDay = Number.isFinite(Number(currentData.max_customers_per_day))
+    ? Number(currentData.max_customers_per_day)
+    : 0;
 
   return {
     ...edge,
@@ -103,9 +109,11 @@ function normalizeEdgeMeta(edge = {}) {
       delayMinutes === 0 &&
       priority === 100 &&
       !expression &&
-      rateLimitPerDay === 0
+      rateLimitPerDay === 0 &&
+      maxCustomersTotal === 0 &&
+      maxCustomersPerDay === 0
         ? undefined
-        : `${inferredType} | p:${priority} | d:${delayMinutes}m | rl:${rateLimitPerDay}/d`,
+        : `${inferredType} | p:${priority} | d:${delayMinutes}m | rl:${rateLimitPerDay}/d | cap:${maxCustomersTotal} | capd:${maxCustomersPerDay}`,
     data: {
       ...currentData,
       condition_result: inferredType === 'true' || inferredType === 'false' ? inferredType : '',
@@ -113,7 +121,9 @@ function normalizeEdgeMeta(edge = {}) {
       priority,
       delay_minutes: delayMinutes,
       expression,
-      rate_limit_per_day: rateLimitPerDay
+      rate_limit_per_day: rateLimitPerDay,
+      max_customers_total: maxCustomersTotal,
+      max_customers_per_day: maxCustomersPerDay
     }
   };
 }
@@ -930,7 +940,7 @@ function App() {
             onClick={() => saveJourney('published')}
             disabled={busy}
           >
-            Save Now
+            Publish
           </button>
         </div>
       </section>
@@ -1300,6 +1310,32 @@ function App() {
                   onChange={(e) =>
                     updateSelectedEdge({
                       rate_limit_per_day: Math.max(0, Number(e.target.value) || 0)
+                    })
+                  }
+                />
+              </label>
+              <label>
+                max_customers_total
+                <input
+                  type="number"
+                  min="0"
+                  value={selectedEdge?.data?.max_customers_total ?? 0}
+                  onChange={(e) =>
+                    updateSelectedEdge({
+                      max_customers_total: Math.max(0, Number(e.target.value) || 0)
+                    })
+                  }
+                />
+              </label>
+              <label>
+                max_customers_per_day
+                <input
+                  type="number"
+                  min="0"
+                  value={selectedEdge?.data?.max_customers_per_day ?? 0}
+                  onChange={(e) =>
+                    updateSelectedEdge({
+                      max_customers_per_day: Math.max(0, Number(e.target.value) || 0)
                     })
                   }
                 />

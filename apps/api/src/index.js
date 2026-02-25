@@ -80,7 +80,7 @@ async function ensureKafkaTopics() {
   await admin.connect();
   try {
     const existingTopics = new Set(await admin.listTopics());
-    const missingTopics = ['event.raw', 'action.triggered'].filter(
+    const missingTopics = ['event.raw', 'action.triggered', 'event.dlq'].filter(
       (topic) => !existingTopics.has(topic)
     );
 
@@ -114,6 +114,18 @@ async function ensureSchema() {
       payload jsonb not null,
       source text not null
     )
+  `);
+  await pgClient.query(`
+    create index if not exists idx_events_customer_type_ts
+      on events (customer_id, event_type, ts desc)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_events_customer_ts
+      on events (customer_id, ts desc)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_events_ts_brin
+      on events using brin (ts)
   `);
 
   await pgClient.query(`
@@ -225,6 +237,87 @@ async function ensureSchema() {
     create index if not exists idx_journey_instances_due
       on journey_instances (state, due_at)
   `);
+  await pgClient.query(`
+    create index if not exists idx_journey_instances_journey_state_due
+      on journey_instances (journey_id, state, due_at)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_journey_instances_customer_updated
+      on journey_instances (customer_id, updated_at desc)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_journey_instances_updated
+      on journey_instances (updated_at desc)
+  `);
+
+  await pgClient.query(`
+    create table if not exists event_dlq (
+      id text primary key,
+      event_id text,
+      customer_id text,
+      event_type text,
+      source_topic text not null,
+      error_message text not null,
+      raw_payload jsonb,
+      created_at timestamptz not null default now()
+    )
+  `);
+  await pgClient.query(`
+    create index if not exists idx_event_dlq_created
+      on event_dlq (created_at desc)
+  `);
+
+  await pgClient.query(`
+    create table if not exists journey_instance_transitions (
+      id text primary key,
+      instance_id text not null,
+      journey_id text not null,
+      journey_version int not null,
+      customer_id text not null,
+      from_state text,
+      to_state text not null,
+      from_node text,
+      to_node text,
+      reason text,
+      event_id text,
+      metadata_json jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now()
+    )
+  `);
+  await pgClient.query(`
+    create index if not exists idx_instance_transitions_lookup
+      on journey_instance_transitions (instance_id, created_at desc)
+  `);
+  await pgClient.query(`
+    create index if not exists idx_instance_transitions_customer
+      on journey_instance_transitions (customer_id, created_at desc)
+  `);
+
+  await pgClient.query(`
+    create table if not exists consumed_events (
+      consumer_group text not null,
+      event_id text not null,
+      consumed_at timestamptz not null default now(),
+      primary key (consumer_group, event_id)
+    )
+  `);
+
+  await pgClient.query(`
+    create table if not exists edge_capacity_usage (
+      journey_id text not null,
+      journey_version int not null,
+      edge_id text not null,
+      window_type text not null,
+      window_start timestamptz not null,
+      used_count int not null default 0,
+      updated_at timestamptz not null default now(),
+      primary key (journey_id, journey_version, edge_id, window_type, window_start)
+    )
+  `);
+  await pgClient.query(`
+    create index if not exists idx_edge_capacity_lookup
+      on edge_capacity_usage (journey_id, journey_version, edge_id, window_type, window_start desc)
+  `);
 
   await pgClient.query(
     `insert into journeys (journey_id, version, name, status, graph_json)
@@ -283,11 +376,22 @@ app.post('/ingest', async (req, res) => {
   try {
     const event = normalizeEvent(req.body);
 
-    await pgClient.query(
+    const insertResult = await pgClient.query(
       `insert into events (event_id, customer_id, event_type, ts, payload, source)
-       values ($1, $2, $3, $4, $5, $6)`,
+       values ($1, $2, $3, $4, $5, $6)
+       on conflict (event_id) do nothing
+       returning event_id`,
       [event.event_id, event.customer_id, event.event_type, event.ts, event.payload, event.source]
     );
+    const isDuplicate = insertResult.rowCount === 0;
+
+    if (isDuplicate) {
+      res.status(200).json({
+        status: 'duplicate_ignored',
+        event_id: event.event_id
+      });
+      return;
+    }
 
     await redis.hSet(`customer:${event.customer_id}`, {
       last_event_type: event.event_type,
@@ -890,6 +994,140 @@ app.get('/journey-instances', async (req, res) => {
         );
 
     res.status(200).json({ status: 'ok', items: result.rows });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/journey-instance-transitions', async (req, res) => {
+  try {
+    const instanceId = req.query.instance_id?.toString();
+    const customerId = req.query.customer_id?.toString();
+    const journeyId = req.query.journey_id?.toString();
+    const limit = parseLimit(req.query.limit, 100, 500);
+    const offset = parseOffset(req.query.offset);
+
+    const conditions = [];
+    const values = [];
+    if (instanceId) {
+      values.push(instanceId);
+      conditions.push(`instance_id = $${values.length}`);
+    }
+    if (customerId) {
+      values.push(customerId);
+      conditions.push(`customer_id = $${values.length}`);
+    }
+    if (journeyId) {
+      values.push(journeyId);
+      conditions.push(`journey_id = $${values.length}`);
+    }
+    const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
+
+    const countResult = await pgClient.query(
+      `select count(*)::int as total
+       from journey_instance_transitions
+       ${whereClause}`,
+      values
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const listValues = [...values, limit, offset];
+    const result = await pgClient.query(
+      `select id, instance_id, journey_id, journey_version, customer_id, from_state, to_state,
+              from_node, to_node, reason, event_id, metadata_json, created_at
+       from journey_instance_transitions
+       ${whereClause}
+       order by created_at desc
+       limit $${listValues.length - 1}
+       offset $${listValues.length}`,
+      listValues
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: {
+        limit,
+        offset,
+        total,
+        has_more: offset + result.rows.length < total
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/dlq-events', async (req, res) => {
+  try {
+    const limit = parseLimit(req.query.limit, 100, 500);
+    const offset = parseOffset(req.query.offset);
+    const result = await pgClient.query(
+      `select id, event_id, customer_id, event_type, source_topic, error_message, raw_payload, created_at
+       from event_dlq
+       order by created_at desc
+       limit $1
+       offset $2`,
+      [limit, offset]
+    );
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: { limit, offset, has_more: result.rows.length === limit }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/edge-capacity-usage', async (req, res) => {
+  try {
+    const journeyId = req.query.journey_id?.toString();
+    const edgeId = req.query.edge_id?.toString();
+    const windowType = req.query.window_type?.toString();
+    const limit = parseLimit(req.query.limit, 100, 500);
+    const offset = parseOffset(req.query.offset);
+
+    const conditions = [];
+    const values = [];
+    if (journeyId) {
+      values.push(journeyId);
+      conditions.push(`journey_id = $${values.length}`);
+    }
+    if (edgeId) {
+      values.push(edgeId);
+      conditions.push(`edge_id = $${values.length}`);
+    }
+    if (windowType) {
+      values.push(windowType);
+      conditions.push(`window_type = $${values.length}`);
+    }
+    const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
+
+    const countResult = await pgClient.query(
+      `select count(*)::int as total
+       from edge_capacity_usage
+       ${whereClause}`,
+      values
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const listValues = [...values, limit, offset];
+    const result = await pgClient.query(
+      `select journey_id, journey_version, edge_id, window_type, window_start, used_count, updated_at
+       from edge_capacity_usage
+       ${whereClause}
+       order by updated_at desc
+       limit $${listValues.length - 1}
+       offset $${listValues.length}`,
+      listValues
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: { limit, offset, total, has_more: offset + result.rows.length < total }
+    });
   } catch (error) {
     res.status(500).json({ status: 'error', message: error.message });
   }
