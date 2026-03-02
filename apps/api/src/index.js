@@ -56,6 +56,16 @@ const CustomerCreateSchema = z.object({
   attributes: z.record(z.any()).default({})
 });
 
+const ReleaseControlUpdateSchema = z.object({
+  version: z.number().int().positive().optional(),
+  rollout_percent: z.number().int().min(0).max(100).optional(),
+  release_paused: z.boolean().optional()
+});
+
+const GlobalPauseUpdateSchema = z.object({
+  enabled: z.boolean()
+});
+
 const ManualWaitReleaseSchema = z.object({
   journey_id: z.string().min(1),
   version: z.number().int().positive().optional(),
@@ -387,6 +397,31 @@ async function ensureSchema() {
       on edge_capacity_usage (journey_id, journey_version, edge_id, window_type, window_start desc)
   `);
 
+  await pgClient.query(`
+    create table if not exists journey_release_controls (
+      journey_id text not null,
+      journey_version int not null,
+      rollout_percent int not null default 100,
+      release_paused boolean not null default false,
+      updated_at timestamptz not null default now(),
+      primary key (journey_id, journey_version)
+    )
+  `);
+
+  await pgClient.query(`
+    create table if not exists runtime_controls (
+      key text primary key,
+      value_json jsonb not null default '{}'::jsonb,
+      updated_at timestamptz not null default now()
+    )
+  `);
+
+  await pgClient.query(
+    `insert into runtime_controls (key, value_json)
+     values ('global_pause', '{"enabled": false}'::jsonb)
+     on conflict (key) do nothing`
+  );
+
   await pgClient.query(
     `insert into journeys (journey_id, version, name, status, graph_json)
      values ($1, $2, $3, $4, $5)
@@ -503,6 +538,200 @@ app.get('/dashboard/kpi', async (_req, res) => {
     });
   } catch (error) {
     res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/dashboard/journey-performance', async (_req, res) => {
+  try {
+    const result = await pgClient.query(
+      `with trigger_stats as (
+         select journey_id, journey_version, count(*)::int as triggered_24h
+         from journey_instances
+         where started_at >= now() - interval '24 hour'
+         group by journey_id, journey_version
+       ),
+       completion_stats as (
+         select journey_id, journey_version, count(*)::int as completed_24h
+         from journey_instances
+         where completed_at >= now() - interval '24 hour'
+         group by journey_id, journey_version
+       ),
+       fail_stats as (
+         select journey_id, journey_version, count(*)::int as failed_actions_24h
+         from action_log
+         where created_at >= now() - interval '24 hour'
+           and status = 'failed'
+         group by journey_id, journey_version
+       ),
+       wait_stats as (
+         select
+           journey_id,
+           journey_version,
+           avg(extract(epoch from (processing_at - wait_at)))::numeric(12,2) as avg_wait_seconds
+         from (
+           select
+             journey_id,
+             journey_version,
+             instance_id,
+             min(created_at) filter (where to_state in ('waiting', 'waiting_manual')) as wait_at,
+             min(created_at) filter (where to_state = 'processing') as processing_at
+           from journey_instance_transitions
+           where created_at >= now() - interval '24 hour'
+           group by journey_id, journey_version, instance_id
+         ) t
+         where wait_at is not null and processing_at is not null and processing_at >= wait_at
+         group by journey_id, journey_version
+       )
+       select
+         j.journey_id,
+         j.version as journey_version,
+         j.name,
+         coalesce(ts.triggered_24h, 0)::int as triggered_24h,
+         coalesce(cs.completed_24h, 0)::int as completed_24h,
+         coalesce(fs.failed_actions_24h, 0)::int as failed_actions_24h,
+         coalesce(ws.avg_wait_seconds, 0)::numeric(12,2) as avg_wait_seconds
+       from journeys j
+       left join trigger_stats ts
+         on ts.journey_id = j.journey_id and ts.journey_version = j.version
+       left join completion_stats cs
+         on cs.journey_id = j.journey_id and cs.journey_version = j.version
+       left join fail_stats fs
+         on fs.journey_id = j.journey_id and fs.journey_version = j.version
+       left join wait_stats ws
+         on ws.journey_id = j.journey_id and ws.journey_version = j.version
+       where j.status in ('published', 'draft')
+       order by triggered_24h desc, failed_actions_24h desc, j.updated_at desc
+       limit 200`
+    );
+
+    const rows = result.rows.map((row) => ({
+      journey_id: row.journey_id,
+      journey_version: Number(row.journey_version),
+      name: row.name || row.journey_id,
+      triggered_24h: Number(row.triggered_24h || 0),
+      completed_24h: Number(row.completed_24h || 0),
+      failed_actions_24h: Number(row.failed_actions_24h || 0),
+      avg_wait_seconds: Number(row.avg_wait_seconds || 0)
+    }));
+
+    const topByEvents = [...rows]
+      .sort((a, b) => b.triggered_24h - a.triggered_24h)
+      .slice(0, 5);
+    const topByFailures = [...rows]
+      .sort((a, b) => b.failed_actions_24h - a.failed_actions_24h)
+      .slice(0, 5);
+
+    res.status(200).json({
+      status: 'ok',
+      item: {
+        journeys: rows,
+        top_by_events: topByEvents,
+        top_by_failures: topByFailures
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/management/global-pause', async (_req, res) => {
+  try {
+    const result = await pgClient.query(
+      `select value_json
+       from runtime_controls
+       where key = 'global_pause'
+       limit 1`
+    );
+    const enabled = Boolean(result.rows[0]?.value_json?.enabled);
+    res.status(200).json({ status: 'ok', item: { enabled } });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/management/global-pause', async (req, res) => {
+  try {
+    const payload = GlobalPauseUpdateSchema.parse(req.body);
+    await pgClient.query(
+      `insert into runtime_controls (key, value_json, updated_at)
+       values ('global_pause', $1::jsonb, now())
+       on conflict (key)
+       do update set value_json = excluded.value_json, updated_at = now()`,
+      [JSON.stringify({ enabled: payload.enabled })]
+    );
+    res.status(200).json({ status: 'ok', item: { enabled: payload.enabled } });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/management/release-controls', async (_req, res) => {
+  try {
+    const result = await pgClient.query(
+      `with latest as (
+         select j.*,
+                row_number() over (partition by j.journey_id order by j.version desc) as rn
+         from journeys j
+       )
+       select
+         l.journey_id,
+         l.version as journey_version,
+         l.name,
+         l.status,
+         coalesce(rc.rollout_percent, 100)::int as rollout_percent,
+         coalesce(rc.release_paused, false) as release_paused,
+         coalesce(rc.updated_at, l.updated_at) as updated_at
+       from latest l
+       left join journey_release_controls rc
+         on rc.journey_id = l.journey_id and rc.journey_version = l.version
+       where l.rn = 1
+       order by l.journey_id asc`
+    );
+    res.status(200).json({ status: 'ok', items: result.rows });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/management/release-controls/:journeyId', async (req, res) => {
+  try {
+    const journeyId = req.params.journeyId;
+    const payload = ReleaseControlUpdateSchema.parse(req.body);
+    const version = await resolveJourneyVersion(journeyId, payload.version);
+
+    const existing = await pgClient.query(
+      `select rollout_percent, release_paused
+       from journey_release_controls
+       where journey_id = $1 and journey_version = $2
+       limit 1`,
+      [journeyId, version]
+    );
+    const rolloutPercent = payload.rollout_percent ?? Number(existing.rows[0]?.rollout_percent ?? 100);
+    const releasePaused = payload.release_paused ?? Boolean(existing.rows[0]?.release_paused ?? false);
+
+    await pgClient.query(
+      `insert into journey_release_controls
+        (journey_id, journey_version, rollout_percent, release_paused, updated_at)
+       values ($1, $2, $3, $4, now())
+       on conflict (journey_id, journey_version)
+       do update set
+         rollout_percent = excluded.rollout_percent,
+         release_paused = excluded.release_paused,
+         updated_at = now()`,
+      [journeyId, version, rolloutPercent, releasePaused]
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      item: {
+        journey_id: journeyId,
+        journey_version: version,
+        rollout_percent: rolloutPercent,
+        release_paused: releasePaused
+      }
+    });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
   }
 });
 

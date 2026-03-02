@@ -1,14 +1,20 @@
 {
-	email {$ACME_EMAIL}
+    email {$ACME_EMAIL}
+    acme_ca https://acme-v02.api.letsencrypt.org/directory
 }
 
-{$APP_DOMAIN} {
-	encode zstd gzip
-	reverse_proxy frontend:80
+www.tekinspot.com {
+    reverse_proxy frontend:80
 }
 
-{$API_DOMAIN} {
-	encode zstd gzip
-	reverse_proxy api:3001
+api.tekinspot.com {
+    reverse_proxy api:3001
 }
 
+app.tekinspot.com {
+    reverse_proxy frontend:80
+}
+
+tekinspot.com {
+    redir https://www.tekinspot.com{uri} 308
+}

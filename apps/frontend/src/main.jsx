@@ -82,6 +82,14 @@ function formatLogDate(iso) {
   return date.toLocaleString('tr-TR');
 }
 
+function formatDurationMinutes(seconds) {
+  const n = Number(seconds || 0);
+  if (!Number.isFinite(n) || n <= 0) {
+    return '0 dk';
+  }
+  return `${(n / 60).toFixed(1)} dk`;
+}
+
 function createNode(nodeKind, position, id) {
   return {
     id,
@@ -216,6 +224,14 @@ function App() {
   const [manualWaitNodeId, setManualWaitNodeId] = useState('');
   const [dashboardKpi, setDashboardKpi] = useState(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
+  const [dashboardJourneyPerf, setDashboardJourneyPerf] = useState({
+    journeys: [],
+    top_by_events: [],
+    top_by_failures: []
+  });
+  const [globalPauseEnabled, setGlobalPauseEnabled] = useState(false);
+  const [releaseControls, setReleaseControls] = useState([]);
+  const [managementLoading, setManagementLoading] = useState(false);
   const [selectedJourneyKey, setSelectedJourneyKey] = useState('');
   const [draggedJourneyKey, setDraggedJourneyKey] = useState('');
   const [activeDropFolder, setActiveDropFolder] = useState('');
@@ -613,6 +629,109 @@ function App() {
       setDashboardLoading(false);
     }
   }, []);
+
+  const fetchDashboardJourneyPerformance = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/dashboard/journey-performance`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || `Dashboard journey perf failed: ${response.status}`);
+      }
+      const body = await response.json();
+      setDashboardJourneyPerf(
+        body.item || {
+          journeys: [],
+          top_by_events: [],
+          top_by_failures: []
+        }
+      );
+    } catch (error) {
+      setStatusText(`Journey performans hatasi: ${error.message}`);
+    }
+  }, []);
+
+  const fetchManagementData = useCallback(async () => {
+    setManagementLoading(true);
+    try {
+      const [pauseResponse, controlsResponse] = await Promise.all([
+        fetch(`${API_BASE_URL}/management/global-pause`),
+        fetch(`${API_BASE_URL}/management/release-controls`)
+      ]);
+
+      if (!pauseResponse.ok) {
+        throw new Error(`Global pause fetch failed: ${pauseResponse.status}`);
+      }
+      if (!controlsResponse.ok) {
+        throw new Error(`Release controls fetch failed: ${controlsResponse.status}`);
+      }
+
+      const pauseBody = await pauseResponse.json();
+      const controlsBody = await controlsResponse.json();
+      setGlobalPauseEnabled(Boolean(pauseBody?.item?.enabled));
+      setReleaseControls(Array.isArray(controlsBody.items) ? controlsBody.items : []);
+    } catch (error) {
+      setStatusText(`Management fetch hatasi: ${error.message}`);
+    } finally {
+      setManagementLoading(false);
+    }
+  }, []);
+
+  const saveGlobalPause = useCallback(async () => {
+    try {
+      setManagementLoading(true);
+      const response = await fetch(`${API_BASE_URL}/management/global-pause`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: Boolean(globalPauseEnabled) })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.message || `Global pause save failed: ${response.status}`);
+      }
+      setStatusText(`Global pause ${globalPauseEnabled ? 'aktif' : 'pasif'} yapildi.`);
+    } catch (error) {
+      setStatusText(`Global pause hatasi: ${error.message}`);
+    } finally {
+      setManagementLoading(false);
+    }
+  }, [globalPauseEnabled]);
+
+  const saveReleaseControl = useCallback(
+    async (journeyIdToSave) => {
+      const item = releaseControls.find((row) => row.journey_id === journeyIdToSave);
+      if (!item) {
+        return;
+      }
+      try {
+        setManagementLoading(true);
+        const response = await fetch(
+          `${API_BASE_URL}/management/release-controls/${encodeURIComponent(journeyIdToSave)}`,
+          {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              version: Number(item.journey_version),
+              rollout_percent: Number(item.rollout_percent),
+              release_paused: Boolean(item.release_paused)
+            })
+          }
+        );
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.message || `Release control save failed: ${response.status}`);
+        }
+        setStatusText(
+          `${journeyIdToSave} release control kaydedildi (rollout:${item.rollout_percent}%, paused:${item.release_paused}).`
+        );
+        await fetchManagementData();
+      } catch (error) {
+        setStatusText(`Release control hatasi: ${error.message}`);
+      } finally {
+        setManagementLoading(false);
+      }
+    },
+    [fetchManagementData, releaseControls]
+  );
 
   const toggleJourneyLogs = useCallback(async () => {
     if (showJourneyLogs) {
@@ -1016,7 +1135,15 @@ function App() {
       return;
     }
     fetchDashboardKpi();
-  }, [activeMenu, fetchDashboardKpi]);
+    fetchDashboardJourneyPerformance();
+  }, [activeMenu, fetchDashboardJourneyPerformance, fetchDashboardKpi]);
+
+  useEffect(() => {
+    if (activeMenu !== 'Management') {
+      return;
+    }
+    fetchManagementData();
+  }, [activeMenu, fetchManagementData]);
 
   useEffect(() => {
     setJourneyLogs([]);
@@ -1064,7 +1191,7 @@ function App() {
       </aside>
 
       <div className="page">
-      {activeMenu !== 'Dashboards' && viewMode === 'designer' && (
+      {activeMenu === 'Scenarios' && viewMode === 'designer' && (
       <>
       <section className="designerTop">
         <div className="designerTitle">
@@ -1658,7 +1785,7 @@ function App() {
       </>
       )}
 
-      {activeMenu !== 'Dashboards' && viewMode === 'library' && (
+      {activeMenu === 'Scenarios' && viewMode === 'library' && (
         <main className="libraryWorkspace">
           <section className="libraryToolbar">
             <button type="button" className="primary" onClick={newJourney}>
@@ -1756,7 +1883,13 @@ function App() {
         <main className="dashboardWorkspace">
           <section className="dashboardHeader">
             <h2>Genel Durum KPI</h2>
-            <button type="button" onClick={fetchDashboardKpi} disabled={dashboardLoading}>
+            <button
+              type="button"
+              onClick={async () => {
+                await Promise.all([fetchDashboardKpi(), fetchDashboardJourneyPerformance()]);
+              }}
+              disabled={dashboardLoading}
+            >
               {dashboardLoading ? 'Yukleniyor...' : 'Yenile'}
             </button>
           </section>
@@ -1791,9 +1924,169 @@ function App() {
               </div>
             </article>
           </section>
+          <section className="dashboardSplit">
+            <article className="kpiCard">
+              <h3>En Cok Event Alan Journey</h3>
+              <div className="dashboardList">
+                {(dashboardJourneyPerf?.top_by_events || []).map((item) => (
+                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow">
+                    <span>{item.name}</span>
+                    <strong>{item.triggered_24h}</strong>
+                  </div>
+                ))}
+                {(dashboardJourneyPerf?.top_by_events || []).length === 0 && (
+                  <small>Veri yok.</small>
+                )}
+              </div>
+            </article>
+            <article className="kpiCard">
+              <h3>En Cok Fail Ureten Journey</h3>
+              <div className="dashboardList">
+                {(dashboardJourneyPerf?.top_by_failures || []).map((item) => (
+                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow">
+                    <span>{item.name}</span>
+                    <strong>{item.failed_actions_24h}</strong>
+                  </div>
+                ))}
+                {(dashboardJourneyPerf?.top_by_failures || []).length === 0 && (
+                  <small>Veri yok.</small>
+                )}
+              </div>
+            </article>
+          </section>
+          <section className="dashboardTableWrap">
+            <table className="journeyLogsTable">
+              <thead>
+                <tr>
+                  <th>Journey</th>
+                  <th>Version</th>
+                  <th>Tetiklenme (24s)</th>
+                  <th>Completion (24s)</th>
+                  <th>Fail (24s)</th>
+                  <th>Ort. Bekleme</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(dashboardJourneyPerf?.journeys || []).map((item) => (
+                  <tr key={`${item.journey_id}::${item.journey_version}`}>
+                    <td>{item.name}</td>
+                    <td>{item.journey_version}</td>
+                    <td>{item.triggered_24h}</td>
+                    <td>{item.completed_24h}</td>
+                    <td>{item.failed_actions_24h}</td>
+                    <td>{formatDurationMinutes(item.avg_wait_seconds)}</td>
+                  </tr>
+                ))}
+                {(dashboardJourneyPerf?.journeys || []).length === 0 && (
+                  <tr>
+                    <td colSpan={6}>Journey performans verisi yok.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </section>
         </main>
       )}
-      {(activeMenu === 'Dashboards' || viewMode !== 'library') && <div className="statusBar">{statusText}</div>}
+      {activeMenu === 'Management' && (
+        <main className="dashboardWorkspace">
+          <section className="dashboardHeader">
+            <h2>Release Control</h2>
+            <button type="button" onClick={fetchManagementData} disabled={managementLoading}>
+              {managementLoading ? 'Yukleniyor...' : 'Yenile'}
+            </button>
+          </section>
+
+          <section className="kpiCard">
+            <h3>Bakim Modu / Global Pause</h3>
+            <div className="manualQueueToolbar">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={globalPauseEnabled}
+                  onChange={(e) => setGlobalPauseEnabled(e.target.checked)}
+                />
+                Global pause aktif
+              </label>
+              <button type="button" className="primary" onClick={saveGlobalPause} disabled={managementLoading}>
+                Kaydet
+              </button>
+            </div>
+            <small>Aktif olunca yeni eventler ve scheduler akisi durdurulur.</small>
+          </section>
+
+          <section className="dashboardTableWrap">
+            <table className="journeyLogsTable">
+              <thead>
+                <tr>
+                  <th>Journey</th>
+                  <th>Version</th>
+                  <th>Status</th>
+                  <th>Trafik Orani (%)</th>
+                  <th>Journey Pause</th>
+                  <th>Kaydet</th>
+                </tr>
+              </thead>
+              <tbody>
+                {releaseControls.map((item) => (
+                  <tr key={`${item.journey_id}::${item.journey_version}`}>
+                    <td>{item.name || item.journey_id}</td>
+                    <td>{item.journey_version}</td>
+                    <td>{item.status}</td>
+                    <td>
+                      <select
+                        value={Number(item.rollout_percent)}
+                        onChange={(e) =>
+                          setReleaseControls((current) =>
+                            current.map((row) =>
+                              row.journey_id === item.journey_id
+                                ? { ...row, rollout_percent: Number(e.target.value) }
+                                : row
+                            )
+                          )
+                        }
+                      >
+                        <option value={10}>10%</option>
+                        <option value={50}>50%</option>
+                        <option value={100}>100%</option>
+                      </select>
+                    </td>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(item.release_paused)}
+                        onChange={(e) =>
+                          setReleaseControls((current) =>
+                            current.map((row) =>
+                              row.journey_id === item.journey_id
+                                ? { ...row, release_paused: e.target.checked }
+                                : row
+                            )
+                          )
+                        }
+                      />
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        onClick={() => saveReleaseControl(item.journey_id)}
+                        disabled={managementLoading}
+                      >
+                        Kaydet
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {releaseControls.length === 0 && (
+                  <tr>
+                    <td colSpan={6}>Release control verisi yok.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </section>
+        </main>
+      )}
+      {(activeMenu === 'Dashboards' || activeMenu === 'Management' || viewMode !== 'library') && <div className="statusBar">{statusText}</div>}
       </div>
     </div>
   );

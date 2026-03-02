@@ -154,3 +154,22 @@ create table if not exists edge_capacity_usage (
 
 create index if not exists idx_edge_capacity_lookup
   on edge_capacity_usage (journey_id, journey_version, edge_id, window_type, window_start desc);
+
+create table if not exists journey_release_controls (
+  journey_id text not null,
+  journey_version int not null,
+  rollout_percent int not null default 100,
+  release_paused boolean not null default false,
+  updated_at timestamptz not null default now(),
+  primary key (journey_id, journey_version)
+);
+
+create table if not exists runtime_controls (
+  key text primary key,
+  value_json jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+insert into runtime_controls (key, value_json)
+values ('global_pause', '{"enabled": false}'::jsonb)
+on conflict (key) do nothing;

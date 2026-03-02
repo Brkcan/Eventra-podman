@@ -35,6 +35,7 @@ const mailTransporter =
     : null;
 
 let runtimeJourneys = [];
+let runtimeGlobalPause = false;
 
 async function logInstanceTransition({
   instanceId,
@@ -226,6 +227,20 @@ function pickBestRoute(routes) {
     }
     return String(a.edge_id || '').localeCompare(String(b.edge_id || ''));
   })[0];
+}
+
+function isCustomerIncludedInRollout(journey, customerId) {
+  const rolloutPercent = Number(journey?.rollout_percent ?? 100);
+  if (!Number.isFinite(rolloutPercent) || rolloutPercent >= 100) {
+    return true;
+  }
+  if (rolloutPercent <= 0) {
+    return false;
+  }
+
+  const hash = crypto.createHash('sha256').update(`${journey.journey_id}:${customerId}`).digest();
+  const bucket = hash.readUInt32BE(0) % 100;
+  return bucket < rolloutPercent;
 }
 
 function getPathValue(obj, path) {
@@ -742,6 +757,8 @@ function normalizeJourneyDefinition(row) {
     action_channel: actionNode?.data?.channel || actionNode?.channel || 'email',
     action_template_id: actionNode?.data?.template_id || '',
     action_message: actionNode?.data?.label || 'Journey action triggered.',
+    rollout_percent: Number(row.rollout_percent ?? 100),
+    release_paused: Boolean(row.release_paused),
     action_node_map: Object.fromEntries(
       nodes
         .filter((node) => getNodeKind(node) === 'action')
@@ -760,14 +777,31 @@ function normalizeJourneyDefinition(row) {
 async function refreshRuntimeJourneys() {
   const result = await pgClient.query(
     `with ranked as (
-       select *, row_number() over (partition by journey_id order by version desc) as rn
-       from journeys
-       where status = 'published'
+       select j.*,
+              row_number() over (partition by j.journey_id order by j.version desc) as rn
+       from journeys j
+       where j.status = 'published'
+     ),
+     gp as (
+       select coalesce((value_json->>'enabled')::boolean, false) as enabled
+       from runtime_controls
+       where key = 'global_pause'
+       limit 1
      )
-     select journey_id, version, graph_json
-     from ranked
-     where rn = 1`
+     select
+       r.journey_id,
+       r.version,
+       r.graph_json,
+       coalesce(rc.rollout_percent, 100)::int as rollout_percent,
+       coalesce(rc.release_paused, false) as release_paused,
+       coalesce((select enabled from gp), false) as global_pause
+     from ranked r
+     left join journey_release_controls rc
+       on rc.journey_id = r.journey_id and rc.journey_version = r.version
+     where r.rn = 1`
   );
+
+  runtimeGlobalPause = Boolean(result.rows[0]?.global_pause);
 
   runtimeJourneys = result.rows
     .map((row) => normalizeJourneyDefinition(row))
@@ -986,6 +1020,31 @@ async function ensureSchema() {
   `);
 
   await pgClient.query(`
+    create table if not exists journey_release_controls (
+      journey_id text not null,
+      journey_version int not null,
+      rollout_percent int not null default 100,
+      release_paused boolean not null default false,
+      updated_at timestamptz not null default now(),
+      primary key (journey_id, journey_version)
+    )
+  `);
+
+  await pgClient.query(`
+    create table if not exists runtime_controls (
+      key text primary key,
+      value_json jsonb not null default '{}'::jsonb,
+      updated_at timestamptz not null default now()
+    )
+  `);
+
+  await pgClient.query(
+    `insert into runtime_controls (key, value_json)
+     values ('global_pause', '{"enabled": false}'::jsonb)
+     on conflict (key) do nothing`
+  );
+
+  await pgClient.query(`
     create table if not exists edge_capacity_usage (
       journey_id text not null,
       journey_version int not null,
@@ -1093,7 +1152,16 @@ async function createOrReplaceWaitingInstance(journey, event) {
 }
 
 async function processEvent(event) {
+  if (runtimeGlobalPause) {
+    return;
+  }
   for (const journey of runtimeJourneys) {
+    if (journey.release_paused) {
+      continue;
+    }
+    if (!isCustomerIncludedInRollout(journey, event.customer_id)) {
+      continue;
+    }
     if (event.event_type === journey.trigger_event_type) {
       await createOrReplaceWaitingInstance(journey, event);
     }
@@ -1530,7 +1598,13 @@ async function evaluateDueJourney(journey) {
 
 async function evaluateDueJourneys() {
   await refreshRuntimeJourneys();
+  if (runtimeGlobalPause) {
+    return;
+  }
   for (const journey of runtimeJourneys) {
+    if (journey.release_paused) {
+      continue;
+    }
     await evaluateDueJourney(journey);
   }
 }

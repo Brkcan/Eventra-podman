@@ -515,6 +515,12 @@ button:disabled {
   gap: 12px;
 }
 
+.dashboardSplit {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+}
+
 .kpiCard {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -544,6 +550,30 @@ button:disabled {
 .kpiSub {
   font-size: 12px;
   color: #6e5639;
+}
+
+.dashboardList {
+  display: grid;
+  gap: 6px;
+}
+
+.dashboardListRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #dfc8a7;
+  border-radius: 8px;
+  background: rgba(255, 252, 246, 0.8);
+  padding: 7px 8px;
+  font-size: 13px;
+}
+
+.dashboardTableWrap {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 251, 243, 0.9);
+  overflow: auto;
 }
 
 .libraryToolbar {
