@@ -74,6 +74,44 @@ const ManualWaitReleaseSchema = z.object({
   released_by: z.string().min(1).optional()
 });
 
+const CatalogueEventTypeSchema = z.object({
+  event_type: z.string().min(1),
+  description: z.string().default(''),
+  owner: z.string().default(''),
+  version: z.number().int().positive().default(1),
+  required_fields: z.array(z.string()).default([]),
+  schema_json: z.record(z.any()).default({}),
+  sample_payload: z.record(z.any()).default({}),
+  is_active: z.boolean().default(true)
+});
+
+const CatalogueSegmentSchema = z.object({
+  segment_key: z.string().min(1),
+  display_name: z.string().default(''),
+  rule_expression: z.string().default(''),
+  description: z.string().default(''),
+  is_active: z.boolean().default(true)
+});
+
+const CatalogueTemplateSchema = z.object({
+  template_id: z.string().min(1),
+  channel: z.enum(['email', 'sms', 'push']).default('email'),
+  subject: z.string().default(''),
+  body: z.string().default(''),
+  variables: z.array(z.string()).default([]),
+  is_active: z.boolean().default(true)
+});
+
+const CatalogueEndpointSchema = z.object({
+  endpoint_id: z.string().min(1),
+  method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).default('POST'),
+  url: z.string().url(),
+  headers: z.record(z.any()).default({}),
+  timeout_ms: z.number().int().min(100).max(60000).default(5000),
+  description: z.string().default(''),
+  is_active: z.boolean().default(true)
+});
+
 const kafka = new Kafka({ clientId: kafkaClientId, brokers: kafkaBrokers });
 const admin = kafka.admin();
 const producer = kafka.producer({
@@ -416,6 +454,70 @@ async function ensureSchema() {
     )
   `);
 
+  await pgClient.query(`
+    create table if not exists catalogue_event_types (
+      event_type text primary key,
+      description text not null default '',
+      owner text not null default '',
+      version int not null default 1,
+      required_fields jsonb not null default '[]'::jsonb,
+      schema_json jsonb not null default '{}'::jsonb,
+      sample_payload jsonb not null default '{}'::jsonb,
+      is_active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    )
+  `);
+  await pgClient.query(
+    `alter table catalogue_event_types add column if not exists owner text not null default ''`
+  );
+  await pgClient.query(
+    `alter table catalogue_event_types add column if not exists version int not null default 1`
+  );
+  await pgClient.query(
+    `alter table catalogue_event_types add column if not exists required_fields jsonb not null default '[]'::jsonb`
+  );
+  await pgClient.query(
+    `alter table catalogue_event_types add column if not exists schema_json jsonb not null default '{}'::jsonb`
+  );
+
+  await pgClient.query(`
+    create table if not exists catalogue_segments (
+      segment_key text primary key,
+      display_name text not null default '',
+      rule_expression text not null default '',
+      description text not null default '',
+      is_active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    )
+  `);
+  await pgClient.query(`
+    create table if not exists catalogue_templates (
+      template_id text primary key,
+      channel text not null,
+      subject text not null default '',
+      body text not null default '',
+      variables jsonb not null default '[]'::jsonb,
+      is_active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    )
+  `);
+  await pgClient.query(`
+    create table if not exists catalogue_endpoints (
+      endpoint_id text primary key,
+      method text not null,
+      url text not null,
+      headers jsonb not null default '{}'::jsonb,
+      timeout_ms int not null default 5000,
+      description text not null default '',
+      is_active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    )
+  `);
+
   await pgClient.query(
     `insert into runtime_controls (key, value_json)
      values ('global_pause', '{"enabled": false}'::jsonb)
@@ -732,6 +834,535 @@ app.put('/management/release-controls/:journeyId', async (req, res) => {
     });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/catalogues/summary', async (_req, res) => {
+  try {
+    const [events, templates, endpoints, segments] = await Promise.all([
+      pgClient.query(
+        `select count(*)::int as total,
+                count(*) filter (where is_active = true)::int as active_total
+         from catalogue_event_types`
+      ),
+      pgClient.query(
+        `select count(*)::int as total,
+                count(*) filter (where is_active = true)::int as active_total
+         from catalogue_templates`
+      ),
+      pgClient.query(
+        `select count(*)::int as total,
+                count(*) filter (where is_active = true)::int as active_total
+         from catalogue_endpoints`
+      ),
+      pgClient.query(
+        `select count(*)::int as total,
+                count(*) filter (where is_active = true)::int as active_total
+         from catalogue_segments`
+      )
+    ]);
+
+    res.status(200).json({
+      status: 'ok',
+      item: {
+        event_types: events.rows[0] || { total: 0, active_total: 0 },
+        templates: templates.rows[0] || { total: 0, active_total: 0 },
+        endpoints: endpoints.rows[0] || { total: 0, active_total: 0 },
+        segments: segments.rows[0] || { total: 0, active_total: 0 }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/catalogues/event-types', async (_req, res) => {
+  try {
+    const q = _req.query.q?.toString();
+    const limit = parseLimit(_req.query.limit, 100, 500);
+    const offset = parseOffset(_req.query.offset);
+    const values = [];
+    let where = '';
+
+    if (q) {
+      values.push(`%${q}%`);
+      where = `where event_type ilike $1 or description ilike $1`;
+    }
+
+    const countResult = await pgClient.query(
+      `select count(*)::int as total
+       from catalogue_event_types
+       ${where}`,
+      values
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const listValues = [...values, limit, offset];
+    const result = await pgClient.query(
+      `select event_type, description, owner, version, required_fields, schema_json,
+              sample_payload, is_active, created_at, updated_at
+       from catalogue_event_types
+       ${where}
+       order by updated_at desc, event_type asc
+       limit $${listValues.length - 1}
+       offset $${listValues.length}`,
+      listValues
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: { limit, offset, total, has_more: offset + result.rows.length < total }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/catalogues/event-types', async (req, res) => {
+  try {
+    const payload = CatalogueEventTypeSchema.parse(req.body);
+    await pgClient.query(
+      `insert into catalogue_event_types
+        (event_type, description, owner, version, required_fields, schema_json, sample_payload, is_active, updated_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, now())
+       on conflict (event_type)
+       do update set
+         description = excluded.description,
+         owner = excluded.owner,
+         version = excluded.version,
+         required_fields = excluded.required_fields,
+         schema_json = excluded.schema_json,
+         sample_payload = excluded.sample_payload,
+         is_active = excluded.is_active,
+         updated_at = now()`,
+      [
+        payload.event_type,
+        payload.description,
+        payload.owner,
+        payload.version,
+        payload.required_fields,
+        payload.schema_json,
+        payload.sample_payload,
+        payload.is_active
+      ]
+    );
+    res.status(200).json({ status: 'ok', event_type: payload.event_type });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/catalogues/event-types/:eventType', async (req, res) => {
+  try {
+    const pathKey = req.params.eventType;
+    const payload = CatalogueEventTypeSchema.parse({ ...req.body, event_type: pathKey });
+    const result = await pgClient.query(
+      `update catalogue_event_types
+       set description = $2,
+           owner = $3,
+           version = $4,
+           required_fields = $5,
+           schema_json = $6,
+           sample_payload = $7,
+           is_active = $8,
+           updated_at = now()
+       where event_type = $1`,
+      [
+        payload.event_type,
+        payload.description,
+        payload.owner,
+        payload.version,
+        payload.required_fields,
+        payload.schema_json,
+        payload.sample_payload,
+        payload.is_active
+      ]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'event_type not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok', event_type: payload.event_type });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/catalogues/segments', async (_req, res) => {
+  try {
+    const q = _req.query.q?.toString();
+    const limit = parseLimit(_req.query.limit, 100, 500);
+    const offset = parseOffset(_req.query.offset);
+    const values = [];
+    let where = '';
+
+    if (q) {
+      values.push(`%${q}%`);
+      where = `where segment_key ilike $1 or display_name ilike $1 or description ilike $1`;
+    }
+
+    const countResult = await pgClient.query(
+      `select count(*)::int as total
+       from catalogue_segments
+       ${where}`,
+      values
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const listValues = [...values, limit, offset];
+    const result = await pgClient.query(
+      `select segment_key, display_name, rule_expression, description, is_active, created_at, updated_at
+       from catalogue_segments
+       ${where}
+       order by updated_at desc, segment_key asc
+       limit $${listValues.length - 1}
+       offset $${listValues.length}`,
+      listValues
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: { limit, offset, total, has_more: offset + result.rows.length < total }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/catalogues/segments', async (req, res) => {
+  try {
+    const payload = CatalogueSegmentSchema.parse(req.body);
+    await pgClient.query(
+      `insert into catalogue_segments
+        (segment_key, display_name, rule_expression, description, is_active, updated_at)
+       values ($1, $2, $3, $4, $5, now())
+       on conflict (segment_key)
+       do update set
+         display_name = excluded.display_name,
+         rule_expression = excluded.rule_expression,
+         description = excluded.description,
+         is_active = excluded.is_active,
+         updated_at = now()`,
+      [
+        payload.segment_key,
+        payload.display_name,
+        payload.rule_expression,
+        payload.description,
+        payload.is_active
+      ]
+    );
+    res.status(200).json({ status: 'ok', segment_key: payload.segment_key });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/catalogues/segments/:segmentKey', async (req, res) => {
+  try {
+    const payload = CatalogueSegmentSchema.parse({ ...req.body, segment_key: req.params.segmentKey });
+    const result = await pgClient.query(
+      `update catalogue_segments
+       set display_name = $2,
+           rule_expression = $3,
+           description = $4,
+           is_active = $5,
+           updated_at = now()
+       where segment_key = $1`,
+      [
+        payload.segment_key,
+        payload.display_name,
+        payload.rule_expression,
+        payload.description,
+        payload.is_active
+      ]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'segment not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok', segment_key: payload.segment_key });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.delete('/catalogues/segments/:segmentKey', async (req, res) => {
+  try {
+    const result = await pgClient.query(
+      `delete from catalogue_segments
+       where segment_key = $1`,
+      [req.params.segmentKey]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'segment not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.delete('/catalogues/event-types/:eventType', async (req, res) => {
+  try {
+    const result = await pgClient.query(
+      `delete from catalogue_event_types
+       where event_type = $1`,
+      [req.params.eventType]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'event_type not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/catalogues/templates', async (_req, res) => {
+  try {
+    const q = _req.query.q?.toString();
+    const limit = parseLimit(_req.query.limit, 100, 500);
+    const offset = parseOffset(_req.query.offset);
+    const values = [];
+    let where = '';
+
+    if (q) {
+      values.push(`%${q}%`);
+      where = `where template_id ilike $1 or body ilike $1 or subject ilike $1`;
+    }
+
+    const countResult = await pgClient.query(
+      `select count(*)::int as total
+       from catalogue_templates
+       ${where}`,
+      values
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const listValues = [...values, limit, offset];
+    const result = await pgClient.query(
+      `select template_id, channel, subject, body, variables, is_active, created_at, updated_at
+       from catalogue_templates
+       ${where}
+       order by updated_at desc, template_id asc
+       limit $${listValues.length - 1}
+       offset $${listValues.length}`,
+      listValues
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: { limit, offset, total, has_more: offset + result.rows.length < total }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/catalogues/templates', async (req, res) => {
+  try {
+    const payload = CatalogueTemplateSchema.parse(req.body);
+    await pgClient.query(
+      `insert into catalogue_templates
+        (template_id, channel, subject, body, variables, is_active, updated_at)
+       values ($1, $2, $3, $4, $5, $6, now())
+       on conflict (template_id)
+       do update set
+         channel = excluded.channel,
+         subject = excluded.subject,
+         body = excluded.body,
+         variables = excluded.variables,
+         is_active = excluded.is_active,
+         updated_at = now()`,
+      [
+        payload.template_id,
+        payload.channel,
+        payload.subject,
+        payload.body,
+        payload.variables,
+        payload.is_active
+      ]
+    );
+    res.status(200).json({ status: 'ok', template_id: payload.template_id });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/catalogues/templates/:templateId', async (req, res) => {
+  try {
+    const payload = CatalogueTemplateSchema.parse({ ...req.body, template_id: req.params.templateId });
+    const result = await pgClient.query(
+      `update catalogue_templates
+       set channel = $2,
+           subject = $3,
+           body = $4,
+           variables = $5,
+           is_active = $6,
+           updated_at = now()
+       where template_id = $1`,
+      [
+        payload.template_id,
+        payload.channel,
+        payload.subject,
+        payload.body,
+        payload.variables,
+        payload.is_active
+      ]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'template not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok', template_id: payload.template_id });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.delete('/catalogues/templates/:templateId', async (req, res) => {
+  try {
+    const result = await pgClient.query(
+      `delete from catalogue_templates
+       where template_id = $1`,
+      [req.params.templateId]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'template not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/catalogues/endpoints', async (_req, res) => {
+  try {
+    const q = _req.query.q?.toString();
+    const limit = parseLimit(_req.query.limit, 100, 500);
+    const offset = parseOffset(_req.query.offset);
+    const values = [];
+    let where = '';
+
+    if (q) {
+      values.push(`%${q}%`);
+      where = `where endpoint_id ilike $1 or url ilike $1 or description ilike $1`;
+    }
+
+    const countResult = await pgClient.query(
+      `select count(*)::int as total
+       from catalogue_endpoints
+       ${where}`,
+      values
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const listValues = [...values, limit, offset];
+    const result = await pgClient.query(
+      `select endpoint_id, method, url, headers, timeout_ms, description, is_active, created_at, updated_at
+       from catalogue_endpoints
+       ${where}
+       order by updated_at desc, endpoint_id asc
+       limit $${listValues.length - 1}
+       offset $${listValues.length}`,
+      listValues
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows,
+      meta: { limit, offset, total, has_more: offset + result.rows.length < total }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/catalogues/endpoints', async (req, res) => {
+  try {
+    const payload = CatalogueEndpointSchema.parse(req.body);
+    await pgClient.query(
+      `insert into catalogue_endpoints
+        (endpoint_id, method, url, headers, timeout_ms, description, is_active, updated_at)
+       values ($1, $2, $3, $4, $5, $6, $7, now())
+       on conflict (endpoint_id)
+       do update set
+         method = excluded.method,
+         url = excluded.url,
+         headers = excluded.headers,
+         timeout_ms = excluded.timeout_ms,
+         description = excluded.description,
+         is_active = excluded.is_active,
+         updated_at = now()`,
+      [
+        payload.endpoint_id,
+        payload.method,
+        payload.url,
+        payload.headers,
+        payload.timeout_ms,
+        payload.description,
+        payload.is_active
+      ]
+    );
+    res.status(200).json({ status: 'ok', endpoint_id: payload.endpoint_id });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/catalogues/endpoints/:endpointId', async (req, res) => {
+  try {
+    const payload = CatalogueEndpointSchema.parse({ ...req.body, endpoint_id: req.params.endpointId });
+    const result = await pgClient.query(
+      `update catalogue_endpoints
+       set method = $2,
+           url = $3,
+           headers = $4,
+           timeout_ms = $5,
+           description = $6,
+           is_active = $7,
+           updated_at = now()
+       where endpoint_id = $1`,
+      [
+        payload.endpoint_id,
+        payload.method,
+        payload.url,
+        payload.headers,
+        payload.timeout_ms,
+        payload.description,
+        payload.is_active
+      ]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'endpoint not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok', endpoint_id: payload.endpoint_id });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.delete('/catalogues/endpoints/:endpointId', async (req, res) => {
+  try {
+    const result = await pgClient.query(
+      `delete from catalogue_endpoints
+       where endpoint_id = $1`,
+      [req.params.endpointId]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'endpoint not found' });
+      return;
+    }
+    res.status(200).json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
   }
 });
 

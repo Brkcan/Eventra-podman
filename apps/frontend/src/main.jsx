@@ -40,6 +40,7 @@ function normalizeNodeData(data = {}, fallbackId = '') {
     wait_minutes: Number(data.wait_minutes || 30),
     manual_release: Boolean(data.manual_release),
     http_method: data.http_method || 'POST',
+    endpoint_id: data.endpoint_id || '',
     http_url: data.http_url || '',
     http_headers_json: data.http_headers_json || '{}',
     http_body_template: data.http_body_template || '{"customer_id":"{{customer_id}}"}',
@@ -88,6 +89,13 @@ function formatDurationMinutes(seconds) {
     return '0 dk';
   }
   return `${(n / 60).toFixed(1)} dk`;
+}
+
+function parseCsvList(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function createNode(nodeKind, position, id) {
@@ -229,9 +237,50 @@ function App() {
     top_by_events: [],
     top_by_failures: []
   });
+  const [dashboardLastUpdated, setDashboardLastUpdated] = useState('');
   const [globalPauseEnabled, setGlobalPauseEnabled] = useState(false);
   const [releaseControls, setReleaseControls] = useState([]);
   const [managementLoading, setManagementLoading] = useState(false);
+  const [cataloguesLoading, setCataloguesLoading] = useState(false);
+  const [catalogueSummary, setCatalogueSummary] = useState(null);
+  const [catalogueEventTypes, setCatalogueEventTypes] = useState([]);
+  const [catalogueSegments, setCatalogueSegments] = useState([]);
+  const [catalogueTemplates, setCatalogueTemplates] = useState([]);
+  const [catalogueEndpoints, setCatalogueEndpoints] = useState([]);
+  const [eventTypeForm, setEventTypeForm] = useState({
+    event_type: '',
+    description: '',
+    owner: '',
+    version: 1,
+    required_fields_csv: '',
+    schema_json: '{}',
+    sample_payload: '{}',
+    is_active: true
+  });
+  const [segmentForm, setSegmentForm] = useState({
+    segment_key: '',
+    display_name: '',
+    rule_expression: '',
+    description: '',
+    is_active: true
+  });
+  const [templateForm, setTemplateForm] = useState({
+    template_id: '',
+    channel: 'email',
+    subject: '',
+    body: '',
+    variables_csv: '',
+    is_active: true
+  });
+  const [endpointForm, setEndpointForm] = useState({
+    endpoint_id: '',
+    method: 'POST',
+    url: '',
+    headers: '{}',
+    timeout_ms: 5000,
+    description: '',
+    is_active: true
+  });
   const [selectedJourneyKey, setSelectedJourneyKey] = useState('');
   const [draggedJourneyKey, setDraggedJourneyKey] = useState('');
   const [activeDropFolder, setActiveDropFolder] = useState('');
@@ -258,6 +307,37 @@ function App() {
       }),
     [nodes]
   );
+  const activeEventTypeOptions = useMemo(
+    () =>
+      catalogueEventTypes
+        .filter((item) => Boolean(item?.is_active))
+        .map((item) => String(item.event_type)),
+    [catalogueEventTypes]
+  );
+  const activeTemplateOptions = useMemo(
+    () => catalogueTemplates.filter((item) => Boolean(item?.is_active)),
+    [catalogueTemplates]
+  );
+  const activeSegmentOptions = useMemo(
+    () => catalogueSegments.filter((item) => Boolean(item?.is_active)),
+    [catalogueSegments]
+  );
+  const activeEndpointOptions = useMemo(
+    () => catalogueEndpoints.filter((item) => Boolean(item?.is_active)),
+    [catalogueEndpoints]
+  );
+  const topEventMax = useMemo(() => {
+    const values = (dashboardJourneyPerf?.top_by_events || []).map((item) =>
+      Number(item.triggered_24h || 0)
+    );
+    return Math.max(1, ...values, 1);
+  }, [dashboardJourneyPerf]);
+  const topFailMax = useMemo(() => {
+    const values = (dashboardJourneyPerf?.top_by_failures || []).map((item) =>
+      Number(item.failed_actions_24h || 0)
+    );
+    return Math.max(1, ...values, 1);
+  }, [dashboardJourneyPerf]);
 
   const journeysInSelectedFolder = useMemo(
     () =>
@@ -623,6 +703,7 @@ function App() {
       }
       const body = await response.json();
       setDashboardKpi(body.item || null);
+      setDashboardLastUpdated(new Date().toLocaleString('tr-TR'));
     } catch (error) {
       setStatusText(`Dashboard KPI hatasi: ${error.message}`);
     } finally {
@@ -645,6 +726,7 @@ function App() {
           top_by_failures: []
         }
       );
+      setDashboardLastUpdated(new Date().toLocaleString('tr-TR'));
     } catch (error) {
       setStatusText(`Journey performans hatasi: ${error.message}`);
     }
@@ -731,6 +813,216 @@ function App() {
       }
     },
     [fetchManagementData, releaseControls]
+  );
+
+  const fetchCatalogues = useCallback(async () => {
+    setCataloguesLoading(true);
+    try {
+      const [summaryRes, eventTypesRes, segmentsRes, templatesRes, endpointsRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/catalogues/summary`),
+        fetch(`${API_BASE_URL}/catalogues/event-types?limit=200&offset=0`),
+        fetch(`${API_BASE_URL}/catalogues/segments?limit=200&offset=0`),
+        fetch(`${API_BASE_URL}/catalogues/templates?limit=200&offset=0`),
+        fetch(`${API_BASE_URL}/catalogues/endpoints?limit=200&offset=0`)
+      ]);
+
+      if (!summaryRes.ok) throw new Error(`Catalogue summary failed: ${summaryRes.status}`);
+      if (!eventTypesRes.ok) throw new Error(`Event types failed: ${eventTypesRes.status}`);
+      if (!segmentsRes.ok) throw new Error(`Segments failed: ${segmentsRes.status}`);
+      if (!templatesRes.ok) throw new Error(`Templates failed: ${templatesRes.status}`);
+      if (!endpointsRes.ok) throw new Error(`Endpoints failed: ${endpointsRes.status}`);
+
+      const [summaryBody, eventTypesBody, segmentsBody, templatesBody, endpointsBody] = await Promise.all([
+        summaryRes.json(),
+        eventTypesRes.json(),
+        segmentsRes.json(),
+        templatesRes.json(),
+        endpointsRes.json()
+      ]);
+
+      setCatalogueSummary(summaryBody.item || null);
+      setCatalogueEventTypes(Array.isArray(eventTypesBody.items) ? eventTypesBody.items : []);
+      setCatalogueSegments(Array.isArray(segmentsBody.items) ? segmentsBody.items : []);
+      setCatalogueTemplates(Array.isArray(templatesBody.items) ? templatesBody.items : []);
+      setCatalogueEndpoints(Array.isArray(endpointsBody.items) ? endpointsBody.items : []);
+    } catch (error) {
+      setStatusText(`Catalogues fetch hatasi: ${error.message}`);
+    } finally {
+      setCataloguesLoading(false);
+    }
+  }, []);
+
+  const saveEventType = useCallback(async () => {
+    const eventType = String(eventTypeForm.event_type || '').trim();
+    if (!eventType) {
+      setStatusText('event_type zorunlu.');
+      return;
+    }
+    const parsed = parseJsonText(eventTypeForm.sample_payload || '{}');
+    if (!parsed.ok || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+      setStatusText(`sample_payload JSON hatasi: ${parsed.message}`);
+      return;
+    }
+    const schemaParsed = parseJsonText(eventTypeForm.schema_json || '{}');
+    if (!schemaParsed.ok || typeof schemaParsed.value !== 'object' || Array.isArray(schemaParsed.value)) {
+      setStatusText(`schema_json JSON hatasi: ${schemaParsed.message}`);
+      return;
+    }
+    try {
+      setCataloguesLoading(true);
+      const response = await fetch(`${API_BASE_URL}/catalogues/event-types`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          event_type: eventType,
+          description: eventTypeForm.description || '',
+          owner: eventTypeForm.owner || '',
+          version: Math.max(1, Number(eventTypeForm.version) || 1),
+          required_fields: parseCsvList(eventTypeForm.required_fields_csv),
+          schema_json: schemaParsed.value,
+          sample_payload: parsed.value,
+          is_active: Boolean(eventTypeForm.is_active)
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.message || `Event type save failed: ${response.status}`);
+      setStatusText(`Event type kaydedildi: ${eventType}`);
+      await fetchCatalogues();
+    } catch (error) {
+      setStatusText(`Event type kayit hatasi: ${error.message}`);
+    } finally {
+      setCataloguesLoading(false);
+    }
+  }, [eventTypeForm, fetchCatalogues]);
+
+  const saveSegment = useCallback(async () => {
+    const segmentKey = String(segmentForm.segment_key || '').trim();
+    if (!segmentKey) {
+      setStatusText('segment_key zorunlu.');
+      return;
+    }
+    try {
+      setCataloguesLoading(true);
+      const response = await fetch(`${API_BASE_URL}/catalogues/segments`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          segment_key: segmentKey,
+          display_name: segmentForm.display_name || '',
+          rule_expression: segmentForm.rule_expression || '',
+          description: segmentForm.description || '',
+          is_active: Boolean(segmentForm.is_active)
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.message || `Segment save failed: ${response.status}`);
+      setStatusText(`Segment kaydedildi: ${segmentKey}`);
+      await fetchCatalogues();
+    } catch (error) {
+      setStatusText(`Segment kayit hatasi: ${error.message}`);
+    } finally {
+      setCataloguesLoading(false);
+    }
+  }, [fetchCatalogues, segmentForm]);
+
+  const saveTemplate = useCallback(async () => {
+    const templateId = String(templateForm.template_id || '').trim();
+    if (!templateId) {
+      setStatusText('template_id zorunlu.');
+      return;
+    }
+    try {
+      setCataloguesLoading(true);
+      const response = await fetch(`${API_BASE_URL}/catalogues/templates`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          template_id: templateId,
+          channel: templateForm.channel,
+          subject: templateForm.subject || '',
+          body: templateForm.body || '',
+          variables: parseCsvList(templateForm.variables_csv),
+          is_active: Boolean(templateForm.is_active)
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.message || `Template save failed: ${response.status}`);
+      setStatusText(`Template kaydedildi: ${templateId}`);
+      await fetchCatalogues();
+    } catch (error) {
+      setStatusText(`Template kayit hatasi: ${error.message}`);
+    } finally {
+      setCataloguesLoading(false);
+    }
+  }, [fetchCatalogues, templateForm]);
+
+  const saveEndpoint = useCallback(async () => {
+    const endpointId = String(endpointForm.endpoint_id || '').trim();
+    if (!endpointId) {
+      setStatusText('endpoint_id zorunlu.');
+      return;
+    }
+    const headersParsed = parseJsonText(endpointForm.headers || '{}');
+    if (!headersParsed.ok || typeof headersParsed.value !== 'object' || Array.isArray(headersParsed.value)) {
+      setStatusText(`headers JSON hatasi: ${headersParsed.message}`);
+      return;
+    }
+    try {
+      setCataloguesLoading(true);
+      const response = await fetch(`${API_BASE_URL}/catalogues/endpoints`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          endpoint_id: endpointId,
+          method: endpointForm.method,
+          url: endpointForm.url,
+          headers: headersParsed.value,
+          timeout_ms: Math.max(100, Number(endpointForm.timeout_ms) || 5000),
+          description: endpointForm.description || '',
+          is_active: Boolean(endpointForm.is_active)
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.message || `Endpoint save failed: ${response.status}`);
+      setStatusText(`Endpoint kaydedildi: ${endpointId}`);
+      await fetchCatalogues();
+    } catch (error) {
+      setStatusText(`Endpoint kayit hatasi: ${error.message}`);
+    } finally {
+      setCataloguesLoading(false);
+    }
+  }, [endpointForm, fetchCatalogues]);
+
+  const deleteCatalogueItem = useCallback(
+    async (type, key) => {
+      const map = {
+        event_type: `/catalogues/event-types/${encodeURIComponent(key)}`,
+        segment: `/catalogues/segments/${encodeURIComponent(key)}`,
+        template: `/catalogues/templates/${encodeURIComponent(key)}`,
+        endpoint: `/catalogues/endpoints/${encodeURIComponent(key)}`
+      };
+      const endpoint = map[type];
+      if (!endpoint) {
+        return;
+      }
+      const confirmed = window.confirm(`${key} silinsin mi?`);
+      if (!confirmed) {
+        return;
+      }
+      try {
+        setCataloguesLoading(true);
+        const response = await fetch(`${API_BASE_URL}${endpoint}`, { method: 'DELETE' });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.message || `Delete failed: ${response.status}`);
+        setStatusText(`Silindi: ${key}`);
+        await fetchCatalogues();
+      } catch (error) {
+        setStatusText(`Silme hatasi: ${error.message}`);
+      } finally {
+        setCataloguesLoading(false);
+      }
+    },
+    [fetchCatalogues]
   );
 
   const toggleJourneyLogs = useCallback(async () => {
@@ -1146,6 +1438,35 @@ function App() {
   }, [activeMenu, fetchManagementData]);
 
   useEffect(() => {
+    if (activeMenu !== 'Catalogues') {
+      return;
+    }
+    fetchCatalogues();
+  }, [activeMenu, fetchCatalogues]);
+
+  useEffect(() => {
+    if (activeMenu !== 'Scenarios') {
+      return;
+    }
+    if (
+      catalogueEventTypes.length > 0 ||
+      catalogueSegments.length > 0 ||
+      catalogueTemplates.length > 0 ||
+      catalogueEndpoints.length > 0
+    ) {
+      return;
+    }
+    fetchCatalogues();
+  }, [
+    activeMenu,
+    catalogueEndpoints.length,
+    catalogueEventTypes.length,
+    catalogueSegments.length,
+    catalogueTemplates.length,
+    fetchCatalogues
+  ]);
+
+  useEffect(() => {
     setJourneyLogs([]);
     setJourneyLogsWindowLabel('Henuz yuklenmedi');
     setManualQueueItems([]);
@@ -1376,10 +1697,21 @@ function App() {
               {selectedData.node_kind === 'trigger' && (
                 <label>
                   event_type
-                  <input
-                    value={selectedData.event_type}
+                  <select
+                    value={selectedData.event_type || ''}
                     onChange={(e) => updateSelectedNode({ event_type: e.target.value })}
-                  />
+                  >
+                    <option value="">Sec...</option>
+                    {activeEventTypeOptions.map((eventType) => (
+                      <option key={eventType} value={eventType}>
+                        {eventType}
+                      </option>
+                    ))}
+                    {!activeEventTypeOptions.includes(String(selectedData.event_type || '')) &&
+                      selectedData.event_type && (
+                        <option value={selectedData.event_type}>{selectedData.event_type}</option>
+                      )}
+                  </select>
                 </label>
               )}
 
@@ -1410,6 +1742,42 @@ function App() {
               {selectedData.node_kind === 'http_call' && (
                 <>
                   <label>
+                    endpoint_id
+                    <select
+                      value={selectedData.endpoint_id || ''}
+                      onChange={(e) => {
+                        const nextEndpointId = e.target.value;
+                        const matched = activeEndpointOptions.find(
+                          (item) => String(item.endpoint_id) === String(nextEndpointId)
+                        );
+                        if (!matched) {
+                          updateSelectedNode({ endpoint_id: nextEndpointId });
+                          return;
+                        }
+                        updateSelectedNode({
+                          endpoint_id: nextEndpointId,
+                          http_method: String(matched.method || 'POST'),
+                          http_url: String(matched.url || ''),
+                          http_headers_json: JSON.stringify(matched.headers || {}, null, 2),
+                          http_timeout_ms: Math.max(100, Number(matched.timeout_ms) || 5000)
+                        });
+                      }}
+                    >
+                      <option value="">Sec...</option>
+                      {activeEndpointOptions.map((item) => (
+                        <option key={item.endpoint_id} value={item.endpoint_id}>
+                          {item.endpoint_id}
+                        </option>
+                      ))}
+                      {!activeEndpointOptions.some(
+                        (item) => String(item.endpoint_id) === String(selectedData.endpoint_id || '')
+                      ) &&
+                        selectedData.endpoint_id && (
+                          <option value={selectedData.endpoint_id}>{selectedData.endpoint_id}</option>
+                        )}
+                    </select>
+                  </label>
+                  <label>
                     http_method
                     <select
                       value={selectedData.http_method}
@@ -1419,6 +1787,7 @@ function App() {
                       <option value="POST">POST</option>
                       <option value="PUT">PUT</option>
                       <option value="PATCH">PATCH</option>
+                      <option value="DELETE">DELETE</option>
                     </select>
                   </label>
                   <label>
@@ -1512,23 +1881,53 @@ function App() {
                     selectedData.condition_key === 'event_exists') && (
                     <label>
                       condition_event_type
-                      <input
-                        value={selectedData.condition_event_type}
+                      <select
+                        value={selectedData.condition_event_type || ''}
                         onChange={(e) =>
                           updateSelectedNode({ condition_event_type: e.target.value })
                         }
-                      />
+                      >
+                        <option value="">Sec...</option>
+                        {activeEventTypeOptions.map((eventType) => (
+                          <option key={eventType} value={eventType}>
+                            {eventType}
+                          </option>
+                        ))}
+                        {!activeEventTypeOptions.includes(String(selectedData.condition_event_type || '')) &&
+                          selectedData.condition_event_type && (
+                            <option value={selectedData.condition_event_type}>
+                              {selectedData.condition_event_type}
+                            </option>
+                          )}
+                      </select>
                     </label>
                   )}
                   {selectedData.condition_key === 'segment_match' && (
                     <label>
                       condition_segment_value
-                      <input
-                        value={selectedData.condition_segment_value}
+                      <select
+                        value={selectedData.condition_segment_value || ''}
                         onChange={(e) =>
                           updateSelectedNode({ condition_segment_value: e.target.value })
                         }
-                      />
+                      >
+                        <option value="">Sec...</option>
+                        {activeSegmentOptions.map((segment) => (
+                          <option key={segment.segment_key} value={segment.segment_key}>
+                            {segment.segment_key}
+                          </option>
+                        ))}
+                        {!activeSegmentOptions.some(
+                          (segment) =>
+                            String(segment.segment_key) ===
+                            String(selectedData.condition_segment_value || '')
+                        ) &&
+                          selectedData.condition_segment_value && (
+                            <option value={selectedData.condition_segment_value}>
+                              {selectedData.condition_segment_value}
+                            </option>
+                          )}
+                      </select>
                     </label>
                   )}
                 </>
@@ -1550,10 +1949,36 @@ function App() {
 
                   <label>
                     template_id
-                    <input
-                      value={selectedData.template_id}
-                      onChange={(e) => updateSelectedNode({ template_id: e.target.value })}
-                    />
+                    <select
+                      value={selectedData.template_id || ''}
+                      onChange={(e) => {
+                        const nextTemplateId = e.target.value;
+                        const matched = activeTemplateOptions.find(
+                          (item) => String(item.template_id) === String(nextTemplateId)
+                        );
+                        if (!matched) {
+                          updateSelectedNode({ template_id: nextTemplateId });
+                          return;
+                        }
+                        updateSelectedNode({
+                          template_id: nextTemplateId,
+                          channel: String(matched.channel || selectedData.channel || 'email')
+                        });
+                      }}
+                    >
+                      <option value="">Sec...</option>
+                      {activeTemplateOptions.map((item) => (
+                        <option key={item.template_id} value={item.template_id}>
+                          {item.template_id}
+                        </option>
+                      ))}
+                      {!activeTemplateOptions.some(
+                        (item) => String(item.template_id) === String(selectedData.template_id || '')
+                      ) &&
+                        selectedData.template_id && (
+                          <option value={selectedData.template_id}>{selectedData.template_id}</option>
+                        )}
+                    </select>
                   </label>
                 </>
               )}
@@ -1879,10 +2304,506 @@ function App() {
           <div className="statusBar">{statusText}</div>
         </main>
       )}
-      {activeMenu === 'Dashboards' && (
+      {activeMenu === 'Catalogues' && (
         <main className="dashboardWorkspace">
           <section className="dashboardHeader">
-            <h2>Genel Durum KPI</h2>
+            <h2>Catalogues</h2>
+            <button type="button" onClick={fetchCatalogues} disabled={cataloguesLoading}>
+              {cataloguesLoading ? 'Yukleniyor...' : 'Yenile'}
+            </button>
+          </section>
+
+          <section className="dashboardGrid">
+            <article className="kpiCard">
+              <h3>Event Types</h3>
+              <div className="kpiValue">{catalogueSummary?.event_types?.total ?? 0}</div>
+              <small>Aktif: {catalogueSummary?.event_types?.active_total ?? 0}</small>
+            </article>
+            <article className="kpiCard">
+              <h3>Templates</h3>
+              <div className="kpiValue">{catalogueSummary?.templates?.total ?? 0}</div>
+              <small>Aktif: {catalogueSummary?.templates?.active_total ?? 0}</small>
+            </article>
+            <article className="kpiCard">
+              <h3>Endpoints</h3>
+              <div className="kpiValue">{catalogueSummary?.endpoints?.total ?? 0}</div>
+              <small>Aktif: {catalogueSummary?.endpoints?.active_total ?? 0}</small>
+            </article>
+            <article className="kpiCard">
+              <h3>Segments</h3>
+              <div className="kpiValue">{catalogueSummary?.segments?.total ?? 0}</div>
+              <small>Aktif: {catalogueSummary?.segments?.active_total ?? 0}</small>
+            </article>
+          </section>
+
+          <section className="catalogueSection">
+            <article className="kpiCard">
+              <h3>Event Type Catalogue</h3>
+              <div className="catalogueFormGrid">
+                <label>
+                  event_type
+                  <input
+                    value={eventTypeForm.event_type}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({ ...current, event_type: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  description
+                  <input
+                    value={eventTypeForm.description}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({ ...current, description: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  owner
+                  <input
+                    value={eventTypeForm.owner}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({ ...current, owner: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  version
+                  <input
+                    type="number"
+                    min="1"
+                    value={eventTypeForm.version}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({
+                        ...current,
+                        version: Math.max(1, Number(e.target.value) || 1)
+                      }))
+                    }
+                  />
+                </label>
+                <label className="wide">
+                  required_fields (csv)
+                  <input
+                    value={eventTypeForm.required_fields_csv}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({
+                        ...current,
+                        required_fields_csv: e.target.value
+                      }))
+                    }
+                    placeholder="customer_id, payload.email, payload.amount"
+                  />
+                </label>
+                <label className="wide">
+                  schema_json (json)
+                  <textarea
+                    value={eventTypeForm.schema_json}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({ ...current, schema_json: e.target.value }))
+                    }
+                  />
+                </label>
+                <label className="wide">
+                  sample_payload (json)
+                  <textarea
+                    value={eventTypeForm.sample_payload}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({ ...current, sample_payload: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(eventTypeForm.is_active)}
+                    onChange={(e) =>
+                      setEventTypeForm((current) => ({ ...current, is_active: e.target.checked }))
+                    }
+                  />
+                  active
+                </label>
+                <button type="button" className="primary" onClick={saveEventType} disabled={cataloguesLoading}>
+                  Kaydet
+                </button>
+              </div>
+              <div className="dashboardTableWrap">
+                <table className="journeyLogsTable">
+                  <thead>
+                    <tr>
+                      <th>event_type</th>
+                      <th>owner</th>
+                      <th>version</th>
+                      <th>required_fields</th>
+                      <th>description</th>
+                      <th>active</th>
+                      <th>islem</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {catalogueEventTypes.map((item) => (
+                      <tr key={item.event_type}>
+                        <td>{item.event_type}</td>
+                        <td>{item.owner || '-'}</td>
+                        <td>{item.version || 1}</td>
+                        <td>{Array.isArray(item.required_fields) ? item.required_fields.join(', ') : '-'}</td>
+                        <td>{item.description}</td>
+                        <td>{item.is_active ? 'true' : 'false'}</td>
+                        <td>
+                          <button
+                            type="button"
+                            onClick={() => deleteCatalogueItem('event_type', item.event_type)}
+                            disabled={cataloguesLoading}
+                          >
+                            Sil
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {catalogueEventTypes.length === 0 && (
+                      <tr>
+                        <td colSpan={7}>Event type yok.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article className="kpiCard">
+              <h3>Segment Catalogue</h3>
+              <div className="catalogueFormGrid">
+                <label>
+                  segment_key
+                  <input
+                    value={segmentForm.segment_key}
+                    onChange={(e) =>
+                      setSegmentForm((current) => ({ ...current, segment_key: e.target.value }))
+                    }
+                    placeholder="vip, new_user, risk_high"
+                  />
+                </label>
+                <label>
+                  display_name
+                  <input
+                    value={segmentForm.display_name}
+                    onChange={(e) =>
+                      setSegmentForm((current) => ({ ...current, display_name: e.target.value }))
+                    }
+                  />
+                </label>
+                <label className="wide">
+                  rule_expression
+                  <input
+                    value={segmentForm.rule_expression}
+                    onChange={(e) =>
+                      setSegmentForm((current) => ({
+                        ...current,
+                        rule_expression: e.target.value
+                      }))
+                    }
+                    placeholder="attributes.tier >= 3 && attributes.risk != 'high'"
+                  />
+                </label>
+                <label className="wide">
+                  description
+                  <input
+                    value={segmentForm.description}
+                    onChange={(e) =>
+                      setSegmentForm((current) => ({ ...current, description: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(segmentForm.is_active)}
+                    onChange={(e) =>
+                      setSegmentForm((current) => ({ ...current, is_active: e.target.checked }))
+                    }
+                  />
+                  active
+                </label>
+                <button type="button" className="primary" onClick={saveSegment} disabled={cataloguesLoading}>
+                  Kaydet
+                </button>
+              </div>
+              <div className="dashboardTableWrap">
+                <table className="journeyLogsTable">
+                  <thead>
+                    <tr>
+                      <th>segment_key</th>
+                      <th>display_name</th>
+                      <th>rule_expression</th>
+                      <th>description</th>
+                      <th>active</th>
+                      <th>islem</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {catalogueSegments.map((item) => (
+                      <tr key={item.segment_key}>
+                        <td>{item.segment_key}</td>
+                        <td>{item.display_name}</td>
+                        <td>{item.rule_expression}</td>
+                        <td>{item.description}</td>
+                        <td>{item.is_active ? 'true' : 'false'}</td>
+                        <td>
+                          <button
+                            type="button"
+                            onClick={() => deleteCatalogueItem('segment', item.segment_key)}
+                            disabled={cataloguesLoading}
+                          >
+                            Sil
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {catalogueSegments.length === 0 && (
+                      <tr>
+                        <td colSpan={6}>Segment yok.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article className="kpiCard">
+              <h3>Template Catalogue</h3>
+              <div className="catalogueFormGrid">
+                <label>
+                  template_id
+                  <input
+                    value={templateForm.template_id}
+                    onChange={(e) =>
+                      setTemplateForm((current) => ({ ...current, template_id: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  channel
+                  <select
+                    value={templateForm.channel}
+                    onChange={(e) =>
+                      setTemplateForm((current) => ({ ...current, channel: e.target.value }))
+                    }
+                  >
+                    <option value="email">email</option>
+                    <option value="sms">sms</option>
+                    <option value="push">push</option>
+                  </select>
+                </label>
+                <label>
+                  subject
+                  <input
+                    value={templateForm.subject}
+                    onChange={(e) =>
+                      setTemplateForm((current) => ({ ...current, subject: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  variables (csv)
+                  <input
+                    value={templateForm.variables_csv}
+                    onChange={(e) =>
+                      setTemplateForm((current) => ({ ...current, variables_csv: e.target.value }))
+                    }
+                    placeholder="name,amount,segment"
+                  />
+                </label>
+                <label className="wide">
+                  body
+                  <textarea
+                    value={templateForm.body}
+                    onChange={(e) =>
+                      setTemplateForm((current) => ({ ...current, body: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(templateForm.is_active)}
+                    onChange={(e) =>
+                      setTemplateForm((current) => ({ ...current, is_active: e.target.checked }))
+                    }
+                  />
+                  active
+                </label>
+                <button type="button" className="primary" onClick={saveTemplate} disabled={cataloguesLoading}>
+                  Kaydet
+                </button>
+              </div>
+              <div className="dashboardTableWrap">
+                <table className="journeyLogsTable">
+                  <thead>
+                    <tr>
+                      <th>template_id</th>
+                      <th>channel</th>
+                      <th>subject</th>
+                      <th>active</th>
+                      <th>islem</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {catalogueTemplates.map((item) => (
+                      <tr key={item.template_id}>
+                        <td>{item.template_id}</td>
+                        <td>{item.channel}</td>
+                        <td>{item.subject}</td>
+                        <td>{item.is_active ? 'true' : 'false'}</td>
+                        <td>
+                          <button
+                            type="button"
+                            onClick={() => deleteCatalogueItem('template', item.template_id)}
+                            disabled={cataloguesLoading}
+                          >
+                            Sil
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {catalogueTemplates.length === 0 && (
+                      <tr>
+                        <td colSpan={5}>Template yok.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article className="kpiCard">
+              <h3>Endpoint Catalogue</h3>
+              <div className="catalogueFormGrid">
+                <label>
+                  endpoint_id
+                  <input
+                    value={endpointForm.endpoint_id}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({ ...current, endpoint_id: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  method
+                  <select
+                    value={endpointForm.method}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({ ...current, method: e.target.value }))
+                    }
+                  >
+                    <option value="GET">GET</option>
+                    <option value="POST">POST</option>
+                    <option value="PUT">PUT</option>
+                    <option value="PATCH">PATCH</option>
+                    <option value="DELETE">DELETE</option>
+                  </select>
+                </label>
+                <label>
+                  timeout_ms
+                  <input
+                    type="number"
+                    min="100"
+                    value={endpointForm.timeout_ms}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({
+                        ...current,
+                        timeout_ms: Math.max(100, Number(e.target.value) || 100)
+                      }))
+                    }
+                  />
+                </label>
+                <label className="wide">
+                  url
+                  <input
+                    value={endpointForm.url}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({ ...current, url: e.target.value }))
+                    }
+                  />
+                </label>
+                <label className="wide">
+                  headers (json)
+                  <textarea
+                    value={endpointForm.headers}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({ ...current, headers: e.target.value }))
+                    }
+                  />
+                </label>
+                <label className="wide">
+                  description
+                  <input
+                    value={endpointForm.description}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({ ...current, description: e.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(endpointForm.is_active)}
+                    onChange={(e) =>
+                      setEndpointForm((current) => ({ ...current, is_active: e.target.checked }))
+                    }
+                  />
+                  active
+                </label>
+                <button type="button" className="primary" onClick={saveEndpoint} disabled={cataloguesLoading}>
+                  Kaydet
+                </button>
+              </div>
+              <div className="dashboardTableWrap">
+                <table className="journeyLogsTable">
+                  <thead>
+                    <tr>
+                      <th>endpoint_id</th>
+                      <th>method</th>
+                      <th>url</th>
+                      <th>active</th>
+                      <th>islem</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {catalogueEndpoints.map((item) => (
+                      <tr key={item.endpoint_id}>
+                        <td>{item.endpoint_id}</td>
+                        <td>{item.method}</td>
+                        <td>{item.url}</td>
+                        <td>{item.is_active ? 'true' : 'false'}</td>
+                        <td>
+                          <button
+                            type="button"
+                            onClick={() => deleteCatalogueItem('endpoint', item.endpoint_id)}
+                            disabled={cataloguesLoading}
+                          >
+                            Sil
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {catalogueEndpoints.length === 0 && (
+                      <tr>
+                        <td colSpan={5}>Endpoint yok.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+        </main>
+      )}
+      {activeMenu === 'Dashboards' && (
+        <main className="dashboardWorkspace">
+          <section className="dashboardHeader dashboardHero">
+            <div>
+              <h2>Genel Durum KPI</h2>
+              <small>Operasyon gorunumu, son 24 saat performans ozeti</small>
+            </div>
             <button
               type="button"
               onClick={async () => {
@@ -1893,30 +2814,52 @@ function App() {
               {dashboardLoading ? 'Yukleniyor...' : 'Yenile'}
             </button>
           </section>
+          <section className="dashboardMetaBar">
+            <span className="dashboardChip">Veri araligi: 1s / 24s</span>
+            <span className="dashboardChip">Son yenileme: {dashboardLastUpdated || '-'}</span>
+          </section>
           <section className="dashboardGrid">
-            <article className="kpiCard">
-              <h3>Event Sayisi</h3>
+            <article className="kpiCard dashboardCard">
+              <div className="dashboardCardHead">
+                <span className="dashboardIcon">EV</span>
+                <h3>Event Sayisi</h3>
+              </div>
               <div className="kpiValue">{dashboardKpi?.events_1h ?? 0}</div>
               <small>Son 1 saat</small>
               <div className="kpiSub">24s: {dashboardKpi?.events_24h ?? 0}</div>
             </article>
-            <article className="kpiCard">
-              <h3>Aktif Instance</h3>
+            <article className="kpiCard dashboardCard">
+              <div className="dashboardCardHead">
+                <span className="dashboardIcon">IN</span>
+                <h3>Aktif Instance</h3>
+              </div>
               <div className="kpiValue">{dashboardKpi?.active_instances?.total ?? 0}</div>
               <small>waiting + waiting_manual + processing</small>
               <div className="kpiSub">
                 w:{dashboardKpi?.active_instances?.waiting ?? 0} | wm:{dashboardKpi?.active_instances?.waiting_manual ?? 0} | p:{dashboardKpi?.active_instances?.processing ?? 0}
               </div>
             </article>
-            <article className="kpiCard">
-              <h3>Tamamlanan Journey</h3>
+            <article className="kpiCard dashboardCard">
+              <div className="dashboardCardHead">
+                <span className="dashboardIcon">CM</span>
+                <h3>Tamamlanan Journey</h3>
+              </div>
               <div className="kpiValue">{dashboardKpi?.completed_journeys_24h ?? 0}</div>
               <small>Son 24 saat completed instance</small>
             </article>
-            <article className="kpiCard">
-              <h3>Action Orani (24s)</h3>
+            <article className="kpiCard dashboardCard">
+              <div className="dashboardCardHead">
+                <span className="dashboardIcon">AC</span>
+                <h3>Action Orani (24s)</h3>
+              </div>
               <div className="kpiValue">{dashboardKpi?.actions_24h?.success_rate_pct ?? 0}%</div>
               <small>Basarili oran</small>
+              <div className="dashboardProgress">
+                <span
+                  className="dashboardProgressFill"
+                  style={{ width: `${Math.max(0, Math.min(100, Number(dashboardKpi?.actions_24h?.success_rate_pct ?? 0)))}%` }}
+                />
+              </div>
               <div className="kpiSub">
                 fail: {dashboardKpi?.actions_24h?.failure_rate_pct ?? 0}% | ok:{' '}
                 {dashboardKpi?.actions_24h?.success ?? 0} / fail:{' '}
@@ -1925,13 +2868,23 @@ function App() {
             </article>
           </section>
           <section className="dashboardSplit">
-            <article className="kpiCard">
+            <article className="kpiCard dashboardCard">
               <h3>En Cok Event Alan Journey</h3>
               <div className="dashboardList">
-                {(dashboardJourneyPerf?.top_by_events || []).map((item) => (
-                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow">
-                    <span>{item.name}</span>
+                {(dashboardJourneyPerf?.top_by_events || []).map((item, index) => (
+                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow dashboardRankRow">
+                    <span className="dashboardRank">{index + 1}</span>
+                    <span className="dashboardRankName">{item.name}</span>
                     <strong>{item.triggered_24h}</strong>
+                    <span
+                      className="dashboardMiniBar"
+                      style={{
+                        width: `${Math.max(
+                          12,
+                          Math.round((Number(item.triggered_24h || 0) / topEventMax) * 100)
+                        )}%`
+                      }}
+                    />
                   </div>
                 ))}
                 {(dashboardJourneyPerf?.top_by_events || []).length === 0 && (
@@ -1939,13 +2892,23 @@ function App() {
                 )}
               </div>
             </article>
-            <article className="kpiCard">
+            <article className="kpiCard dashboardCard">
               <h3>En Cok Fail Ureten Journey</h3>
               <div className="dashboardList">
-                {(dashboardJourneyPerf?.top_by_failures || []).map((item) => (
-                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow">
-                    <span>{item.name}</span>
+                {(dashboardJourneyPerf?.top_by_failures || []).map((item, index) => (
+                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow dashboardRankRow fail">
+                    <span className="dashboardRank">{index + 1}</span>
+                    <span className="dashboardRankName">{item.name}</span>
                     <strong>{item.failed_actions_24h}</strong>
+                    <span
+                      className="dashboardMiniBar fail"
+                      style={{
+                        width: `${Math.max(
+                          12,
+                          Math.round((Number(item.failed_actions_24h || 0) / topFailMax) * 100)
+                        )}%`
+                      }}
+                    />
                   </div>
                 ))}
                 {(dashboardJourneyPerf?.top_by_failures || []).length === 0 && (
@@ -1954,7 +2917,11 @@ function App() {
               </div>
             </article>
           </section>
-          <section className="dashboardTableWrap">
+          <section className="dashboardTableWrap dashboardTableCard">
+            <div className="dashboardTableHead">
+              <h3>Journey Bazli Performans</h3>
+              <small>Tetiklenme, completion, fail ve ortalama bekleme suresi</small>
+            </div>
             <table className="journeyLogsTable">
               <thead>
                 <tr>
@@ -2086,7 +3053,7 @@ function App() {
           </section>
         </main>
       )}
-      {(activeMenu === 'Dashboards' || activeMenu === 'Management' || viewMode !== 'library') && <div className="statusBar">{statusText}</div>}
+      {(activeMenu === 'Dashboards' || activeMenu === 'Management' || activeMenu === 'Catalogues' || viewMode !== 'library') && <div className="statusBar">{statusText}</div>}
       </div>
     </div>
   );
