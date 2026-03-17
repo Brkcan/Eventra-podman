@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import {
   addEdge,
   Background,
+  BackgroundVariant,
   Controls,
   MiniMap,
   ReactFlow,
@@ -15,6 +16,19 @@ import './styles.css';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 const DEFAULT_FOLDER = 'Workspace';
 const NAV_ITEMS = ['Scenarios', 'Catalogues', 'Management', 'Dashboards'];
+const DASHBOARD_TABS = [
+  { id: 'kpi', label: 'Genel KPI' },
+  { id: 'top', label: 'Top Journey' },
+  { id: 'cache', label: 'Cache Health' },
+  { id: 'perf', label: 'Journey Performans' }
+];
+const CATALOGUE_TABS = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'events', label: 'Event Types' },
+  { id: 'segments', label: 'Segments' },
+  { id: 'templates', label: 'Templates' },
+  { id: 'endpoints', label: 'Endpoints' }
+];
 
 function defaultLabelForKind(nodeKind) {
   if (nodeKind === 'trigger') return 'Trigger: cart_add';
@@ -30,6 +44,21 @@ function flowTypeForKind(nodeKind) {
   if (nodeKind === 'trigger') return 'input';
   if (nodeKind === 'action') return 'output';
   return undefined;
+}
+
+function nodeClassForKind(nodeKind) {
+  return `node-${String(nodeKind || 'condition')}`;
+}
+
+function minimapNodeColor(node) {
+  const kind = node?.data?.node_kind || node?.type;
+  if (kind === 'trigger') return '#1f7aff';
+  if (kind === 'wait') return '#14b8a6';
+  if (kind === 'cache_lookup') return '#8b5cf6';
+  if (kind === 'http_call') return '#f59e0b';
+  if (kind === 'condition') return '#ef4444';
+  if (kind === 'action') return '#22c55e';
+  return '#7b8aa6';
 }
 
 function normalizeNodeData(data = {}, fallbackId = '') {
@@ -123,6 +152,7 @@ function createNode(nodeKind, position, id) {
     id,
     position,
     type: flowTypeForKind(nodeKind),
+    className: nodeClassForKind(nodeKind),
     data: normalizeNodeData({ node_kind: nodeKind }, id)
   };
 }
@@ -181,33 +211,39 @@ const defaultNodes = [
     id: 'trigger',
     position: { x: 80, y: 120 },
     data: normalizeNodeData({ node_kind: 'trigger' }, 'trigger'),
+    className: nodeClassForKind('trigger'),
     type: 'input'
   },
   {
     id: 'wait',
     position: { x: 340, y: 120 },
-    data: normalizeNodeData({ node_kind: 'wait' }, 'wait')
+    data: normalizeNodeData({ node_kind: 'wait' }, 'wait'),
+    className: nodeClassForKind('wait')
   },
   {
     id: 'http_call',
     position: { x: 860, y: 120 },
-    data: normalizeNodeData({ node_kind: 'http_call' }, 'http_call')
+    data: normalizeNodeData({ node_kind: 'http_call' }, 'http_call'),
+    className: nodeClassForKind('http_call')
   },
   {
     id: 'condition',
     position: { x: 1120, y: 120 },
-    data: normalizeNodeData({ node_kind: 'condition' }, 'condition')
+    data: normalizeNodeData({ node_kind: 'condition' }, 'condition'),
+    className: nodeClassForKind('condition')
   },
   {
     id: 'action',
     position: { x: 1380, y: 120 },
     data: normalizeNodeData({ node_kind: 'action' }, 'action'),
+    className: nodeClassForKind('action'),
     type: 'output'
   },
   {
     id: 'cache_lookup',
     position: { x: 600, y: 120 },
-    data: normalizeNodeData({ node_kind: 'cache_lookup' }, 'cache_lookup')
+    data: normalizeNodeData({ node_kind: 'cache_lookup' }, 'cache_lookup'),
+    className: nodeClassForKind('cache_lookup')
   }
 ];
 
@@ -249,6 +285,8 @@ function App() {
   const [showInspector, setShowInspector] = useState(false);
   const [showJourneyLogs, setShowJourneyLogs] = useState(false);
   const [showManualQueue, setShowManualQueue] = useState(false);
+  const [openDesignerGroup, setOpenDesignerGroup] = useState('view');
+  const [showNodePalette, setShowNodePalette] = useState(false);
   const [journeyLogs, setJourneyLogs] = useState([]);
   const [journeyLogsLoading, setJourneyLogsLoading] = useState(false);
   const [journeyLogsWindowLabel, setJourneyLogsWindowLabel] = useState('Henuz yuklenmedi');
@@ -273,6 +311,8 @@ function App() {
     items: []
   });
   const [dashboardLastUpdated, setDashboardLastUpdated] = useState('');
+  const [dashboardTab, setDashboardTab] = useState('kpi');
+  const [catalogueTab, setCatalogueTab] = useState('overview');
   const [globalPauseEnabled, setGlobalPauseEnabled] = useState(false);
   const [releaseControls, setReleaseControls] = useState([]);
   const [managementLoading, setManagementLoading] = useState(false);
@@ -318,6 +358,14 @@ function App() {
     is_active: true
   });
   const [selectedJourneyKey, setSelectedJourneyKey] = useState('');
+  const [approvalInfo, setApprovalInfo] = useState({
+    state: 'none',
+    requested_by: null,
+    requested_at: null,
+    reviewed_by: null,
+    reviewed_at: null
+  });
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [exprBuilderDatasetKey, setExprBuilderDatasetKey] = useState('');
   const [exprBuilderColumn, setExprBuilderColumn] = useState('');
   const [exprBuilderOperator, setExprBuilderOperator] = useState('>=');
@@ -432,12 +480,24 @@ function App() {
     return Math.max(1, ...values, 1);
   }, [dashboardJourneyPerf]);
 
+  const latestJourneyItems = useMemo(() => {
+    const byId = new Map();
+    for (const item of journeyItems) {
+      const key = String(item.journey_id || '');
+      if (!key) continue;
+      const current = byId.get(key);
+      if (!current || Number(item.version) > Number(current.version)) {
+        byId.set(key, item);
+      }
+    }
+    return [...byId.values()];
+  }, [journeyItems]);
   const journeysInSelectedFolder = useMemo(
     () =>
-      journeyItems.filter(
+      latestJourneyItems.filter(
         (item) => String(item.folder_path || DEFAULT_FOLDER) === String(selectedFolder || DEFAULT_FOLDER)
       ),
-    [journeyItems, selectedFolder]
+    [latestJourneyItems, selectedFolder]
   );
   const allFolders = useMemo(
     () =>
@@ -445,19 +505,19 @@ function App() {
         new Set([
           DEFAULT_FOLDER,
           ...folderItems,
-          ...journeyItems.map((item) => item.folder_path || DEFAULT_FOLDER)
+          ...latestJourneyItems.map((item) => item.folder_path || DEFAULT_FOLDER)
         ])
       ),
-    [folderItems, journeyItems]
+    [folderItems, latestJourneyItems]
   );
   const folderCounts = useMemo(() => {
     const counts = {};
-    for (const item of journeyItems) {
+    for (const item of latestJourneyItems) {
       const folder = item.folder_path || DEFAULT_FOLDER;
       counts[folder] = (counts[folder] || 0) + 1;
     }
     return counts;
-  }, [journeyItems]);
+  }, [latestJourneyItems]);
 
   const onConnect = useCallback(
     (connection) =>
@@ -551,6 +611,7 @@ function App() {
           return {
             ...node,
             type: nextType,
+            className: nodeClassForKind(nextKind),
             data: nextData
           };
         })
@@ -677,6 +738,7 @@ function App() {
         return {
           ...node,
           type: flowTypeForKind(normalized.node_kind),
+          className: nodeClassForKind(normalized.node_kind),
           data: normalized,
           position: node.position || fallbackPosition(index)
         };
@@ -724,6 +786,134 @@ function App() {
     setFolderItems(merged);
     return merged;
   }, []);
+
+  const fetchApprovalInfo = useCallback(
+    async (journeyIdArg = journeyId, versionArg = version) => {
+      if (!journeyIdArg || !versionArg) {
+        setApprovalInfo({
+          state: 'none',
+          requested_by: null,
+          requested_at: null,
+          reviewed_by: null,
+          reviewed_at: null
+        });
+        return null;
+      }
+      try {
+        const params = new URLSearchParams({ version: String(versionArg) });
+        const response = await fetch(
+          `${API_BASE_URL}/journeys/${encodeURIComponent(journeyIdArg)}/approval?${params.toString()}`
+        );
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.message || `Approval fetch failed: ${response.status}`);
+        }
+        const item = body.item || {
+          state: 'none',
+          requested_by: null,
+          requested_at: null,
+          reviewed_by: null,
+          reviewed_at: null
+        };
+        setApprovalInfo(item);
+        return item;
+      } catch (error) {
+        setStatusText(`Approval status hatasi: ${error.message}`);
+        return null;
+      }
+    },
+    [journeyId, version]
+  );
+
+  const requestApproval = useCallback(async () => {
+    try {
+      setApprovalBusy(true);
+      const requestedBy = window.prompt('Request eden kullanici', 'ui') || 'ui';
+      const note = window.prompt('Approval notu (opsiyonel)', '') || '';
+      const response = await fetch(
+        `${API_BASE_URL}/journeys/${encodeURIComponent(journeyId)}/request-approval`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            version: Number(version),
+            requested_by: requestedBy,
+            note
+          })
+        }
+      );
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.message || `Request approval failed: ${response.status}`);
+      }
+      setJourneyStatus('draft');
+      await fetchJourneys();
+      await fetchApprovalInfo(journeyId, version);
+      setStatusText(`Approval istendi: ${journeyId} v${version}`);
+    } catch (error) {
+      setStatusText(`Approval request hatasi: ${error.message}`);
+    } finally {
+      setApprovalBusy(false);
+    }
+  }, [fetchApprovalInfo, fetchJourneys, journeyId, version]);
+
+  const approveJourney = useCallback(async () => {
+    try {
+      setApprovalBusy(true);
+      const reviewedBy = window.prompt('Onaylayan kullanici', 'reviewer') || 'reviewer';
+      const note = window.prompt('Onay notu (opsiyonel)', '') || '';
+      const response = await fetch(`${API_BASE_URL}/journeys/${encodeURIComponent(journeyId)}/approve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: Number(version),
+          reviewed_by: reviewedBy,
+          note
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.message || `Approve failed: ${response.status}`);
+      }
+      setJourneyStatus('published');
+      await fetchJourneys();
+      await fetchApprovalInfo(journeyId, version);
+      setStatusText(`Approval onaylandi ve publish edildi: ${journeyId} v${version}`);
+    } catch (error) {
+      setStatusText(`Approve hatasi: ${error.message}`);
+    } finally {
+      setApprovalBusy(false);
+    }
+  }, [fetchApprovalInfo, fetchJourneys, journeyId, version]);
+
+  const rejectJourney = useCallback(async () => {
+    try {
+      setApprovalBusy(true);
+      const reviewedBy = window.prompt('Reddeden kullanici', 'reviewer') || 'reviewer';
+      const note = window.prompt('Red notu', '') || '';
+      const response = await fetch(`${API_BASE_URL}/journeys/${encodeURIComponent(journeyId)}/reject`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: Number(version),
+          reviewed_by: reviewedBy,
+          note
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.message || `Reject failed: ${response.status}`);
+      }
+      setJourneyStatus('draft');
+      await fetchJourneys();
+      await fetchApprovalInfo(journeyId, version);
+      setStatusText(`Approval reddedildi: ${journeyId} v${version}`);
+    } catch (error) {
+      setStatusText(`Reject hatasi: ${error.message}`);
+    } finally {
+      setApprovalBusy(false);
+    }
+  }, [fetchApprovalInfo, fetchJourneys, journeyId, version]);
 
   const fetchJourneyLogs = useCallback(async () => {
     if (!journeyId) {
@@ -1205,6 +1395,7 @@ function App() {
 
     try {
       const finalStatus = statusOverride || journeyStatus;
+      let targetVersion = Number(version);
       for (const node of nodes) {
         const data = normalizeNodeData(node.data, node.id);
         if (data.node_kind === 'cache_lookup' && data.cache_on_miss === 'default') {
@@ -1239,23 +1430,23 @@ function App() {
       }
       const listBody = await listResponse.json();
       const exists = (listBody.items || []).some(
-        (item) => item.journey_id === journeyId && Number(item.version) === Number(version)
+        (item) => item.journey_id === journeyId && Number(item.version) === targetVersion
       );
 
       if (exists) {
-        const confirmed = window.confirm(
-          `Journey ${journeyId} v${version} zaten var. Uzerine yazilsin mi?`
-        );
-        if (!confirmed) {
-          setStatusText('Publish iptal edildi: mevcut version overwrite edilmedi.');
-          setBusy(false);
-          return;
-        }
+        const versions = (listBody.items || [])
+          .filter((item) => item.journey_id === journeyId)
+          .map((item) => Number(item.version))
+          .filter((v) => Number.isInteger(v) && v > 0);
+        const maxVersion = versions.length > 0 ? Math.max(...versions) : targetVersion;
+        targetVersion = maxVersion + 1;
+        setVersion(targetVersion);
+        setStatusText(`Ayni version v${version} vardi, otomatik v${targetVersion} olusturuluyor...`);
       }
 
       const payload = {
         journey_id: journeyId,
-        version,
+        version: targetVersion,
         name,
         status: finalStatus,
         folder_path: selectedFolder || DEFAULT_FOLDER,
@@ -1274,10 +1465,10 @@ function App() {
       }
 
       setJourneyStatus(finalStatus);
-      setStatusText(`Kayit tamamlandi: ${journeyId} v${version} [${finalStatus}]`);
+      setStatusText(`Kayit tamamlandi: ${journeyId} v${targetVersion} [${finalStatus}]`);
       await fetchJourneys();
       await fetchFolders();
-      setSelectedJourneyKey(`${journeyId}::${version}`);
+      setSelectedJourneyKey(`${journeyId}::${targetVersion}`);
     } catch (error) {
       setStatusText(`Kayit hatasi: ${error.message}`);
     } finally {
@@ -1594,6 +1785,13 @@ function App() {
   }, [allFolders, selectedFolder]);
 
   useEffect(() => {
+    if (activeMenu !== 'Scenarios' || viewMode !== 'designer') {
+      return;
+    }
+    fetchApprovalInfo(journeyId, version);
+  }, [activeMenu, fetchApprovalInfo, journeyId, version, viewMode]);
+
+  useEffect(() => {
     if (activeMenu !== 'Dashboards') {
       return;
     }
@@ -1722,25 +1920,59 @@ function App() {
         <div className="brand">EVENTRA</div>
         <nav>
           {NAV_ITEMS.map((item) => (
-            <button
-              key={item}
-              type="button"
-              className={activeMenu === item ? 'navItem active' : 'navItem'}
-              onClick={() => setActiveMenu(item)}
-            >
-              {item}
-            </button>
+            <div key={item} className="navGroup">
+              <button
+                type="button"
+                className={activeMenu === item ? 'navItem active' : 'navItem'}
+                onClick={() => setActiveMenu(item)}
+              >
+                {item}
+              </button>
+              {item === 'Dashboards' && activeMenu === 'Dashboards' && (
+                <div className="navSubmenu">
+                  {DASHBOARD_TABS.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      className={dashboardTab === tab.id ? 'navSubItem active' : 'navSubItem'}
+                      onClick={() => setDashboardTab(tab.id)}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {item === 'Catalogues' && activeMenu === 'Catalogues' && (
+                <div className="navSubmenu">
+                  {CATALOGUE_TABS.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      className={catalogueTab === tab.id ? 'navSubItem active' : 'navSubItem'}
+                      onClick={() => setCatalogueTab(tab.id)}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           ))}
         </nav>
       </aside>
 
-      <div className="page">
+      <div className={activeMenu === 'Scenarios' ? 'page pageScenarios' : 'page'}>
       {activeMenu === 'Scenarios' && viewMode === 'designer' && (
       <>
       <section className="designerTop">
         <div className="designerTitle">
           <strong>{name}</strong>
           <span>Workspace &gt; {selectedFolder} &gt; {journeyId} v{version}</span>
+          <span>
+            Approval: {approvalInfo?.state || 'none'}
+            {approvalInfo?.requested_at ? ` | Request: ${formatLogDate(approvalInfo.requested_at)}` : ''}
+            {approvalInfo?.reviewed_at ? ` | Review: ${formatLogDate(approvalInfo.reviewed_at)}` : ''}
+          </span>
         </div>
         <div className="designerActions">
           <button type="button" onClick={() => setViewMode('library')} disabled={busy}>
@@ -1748,48 +1980,96 @@ function App() {
           </button>
           <button
             type="button"
-            onClick={() => setShowJourneyMeta((prev) => !prev)}
+            className={openDesignerGroup === 'view' ? 'active' : ''}
+            onClick={() => setOpenDesignerGroup((prev) => (prev === 'view' ? '' : 'view'))}
             disabled={busy}
           >
-            {showJourneyMeta ? 'Hide Fields' : 'Journey Fields'}
+            Gorunum
           </button>
           <button
             type="button"
-            onClick={() => setShowManualQueue((prev) => !prev)}
+            className={openDesignerGroup === 'journey' ? 'active' : ''}
+            onClick={() => setOpenDesignerGroup((prev) => (prev === 'journey' ? '' : 'journey'))}
             disabled={busy}
           >
-            {showManualQueue ? 'Hide Manual Queue' : 'Manual Queue'}
+            Journey
           </button>
           <button
             type="button"
-            onClick={toggleJourneyLogs}
-            disabled={busy || journeyLogsLoading}
+            className={openDesignerGroup === 'approval' ? 'active' : ''}
+            onClick={() => setOpenDesignerGroup((prev) => (prev === 'approval' ? '' : 'approval'))}
+            disabled={busy || approvalBusy}
           >
-            {showJourneyLogs
-              ? 'Hide Logs'
-              : journeyLogsLoading
-                ? 'Loading Logs...'
-                : 'Load Last 1h Logs'}
-          </button>
-          <button type="button" onClick={newJourney} disabled={busy}>
-            New
-          </button>
-          <button type="button" className="danger" onClick={deleteJourney} disabled={busy}>
-            Delete Journey
-          </button>
-          <button type="button" onClick={() => saveJourney('draft')} disabled={busy}>
-            Save Draft
+            Onay
           </button>
           <button
             type="button"
             className="primary"
             onClick={() => saveJourney('published')}
-            disabled={busy}
+            disabled={busy || approvalInfo?.state !== 'approved'}
           >
             Publish
           </button>
         </div>
       </section>
+
+      {openDesignerGroup === 'view' && (
+      <section className="designerActionPanel">
+        <button
+          type="button"
+          onClick={() => setShowJourneyMeta((prev) => !prev)}
+          disabled={busy}
+        >
+          {showJourneyMeta ? 'Hide Fields' : 'Journey Fields'}
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowManualQueue((prev) => !prev)}
+          disabled={busy}
+        >
+          {showManualQueue ? 'Hide Manual Queue' : 'Manual Queue'}
+        </button>
+        <button
+          type="button"
+          onClick={toggleJourneyLogs}
+          disabled={busy || journeyLogsLoading}
+        >
+          {showJourneyLogs
+            ? 'Hide Logs'
+            : journeyLogsLoading
+              ? 'Loading Logs...'
+              : 'Load Last 1h Logs'}
+        </button>
+      </section>
+      )}
+
+      {openDesignerGroup === 'journey' && (
+      <section className="designerActionPanel">
+        <button type="button" onClick={newJourney} disabled={busy}>
+          New
+        </button>
+        <button type="button" onClick={() => saveJourney('draft')} disabled={busy}>
+          Save Draft
+        </button>
+        <button type="button" className="danger" onClick={deleteJourney} disabled={busy}>
+          Delete Journey
+        </button>
+      </section>
+      )}
+
+      {openDesignerGroup === 'approval' && (
+      <section className="designerActionPanel">
+        <button type="button" onClick={requestApproval} disabled={busy || approvalBusy}>
+          Request Approval
+        </button>
+        <button type="button" onClick={approveJourney} disabled={busy || approvalBusy}>
+          Approve
+        </button>
+        <button type="button" onClick={rejectJourney} disabled={busy || approvalBusy}>
+          Reject
+        </button>
+      </section>
+      )}
 
       {showJourneyMeta && (
       <section className="controlsBar">
@@ -1836,28 +2116,8 @@ function App() {
       <main className={showInspector ? 'workspace withInspector' : 'workspace noInspector'}>
         <section className="canvas">
           <div className="canvasTools">
-            <button type="button" title="Add Trigger" aria-label="Add Trigger" onClick={() => addNode('trigger')}>
-              <span>T</span> Trigger
-            </button>
-            <button type="button" title="Add Wait" aria-label="Add Wait" onClick={() => addNode('wait')}>
-              <span>W</span> Wait
-            </button>
-            <button
-              type="button"
-              title="Add Cache Lookup"
-              aria-label="Add Cache Lookup"
-              onClick={() => addNode('cache_lookup')}
-            >
-              <span>K</span> Cache
-            </button>
-            <button type="button" title="Add HTTP Call" aria-label="Add HTTP Call" onClick={() => addNode('http_call')}>
-              <span>H</span> HTTP
-            </button>
-            <button type="button" title="Add Condition" aria-label="Add Condition" onClick={() => addNode('condition')}>
-              <span>C</span> Condition
-            </button>
-            <button type="button" title="Add Action" aria-label="Add Action" onClick={() => addNode('action')}>
-              <span>A</span> Action
+            <button type="button" onClick={() => setShowNodePalette((prev) => !prev)}>
+              <span>+</span> {showNodePalette ? 'Hide Nodes' : 'Add Nodes'}
             </button>
             <button
               type="button"
@@ -1868,6 +2128,33 @@ function App() {
             >
               <span>X</span> Delete
             </button>
+            {showNodePalette && (
+              <div className="nodePalette">
+                <button type="button" title="Add Trigger" aria-label="Add Trigger" onClick={() => addNode('trigger')}>
+                  <span>T</span> Trigger
+                </button>
+                <button type="button" title="Add Wait" aria-label="Add Wait" onClick={() => addNode('wait')}>
+                  <span>W</span> Wait
+                </button>
+                <button
+                  type="button"
+                  title="Add Cache Lookup"
+                  aria-label="Add Cache Lookup"
+                  onClick={() => addNode('cache_lookup')}
+                >
+                  <span>K</span> Cache
+                </button>
+                <button type="button" title="Add HTTP Call" aria-label="Add HTTP Call" onClick={() => addNode('http_call')}>
+                  <span>H</span> HTTP
+                </button>
+                <button type="button" title="Add Condition" aria-label="Add Condition" onClick={() => addNode('condition')}>
+                  <span>C</span> Condition
+                </button>
+                <button type="button" title="Add Action" aria-label="Add Action" onClick={() => addNode('action')}>
+                  <span>A</span> Action
+                </button>
+              </div>
+            )}
           </div>
           <ReactFlow
             nodes={nodes}
@@ -1880,9 +2167,14 @@ function App() {
             onPaneClick={onPaneClick}
             fitView
           >
-            <MiniMap />
+            <MiniMap
+              nodeColor={minimapNodeColor}
+              maskColor="rgba(15, 42, 92, 0.18)"
+              pannable
+              zoomable
+            />
             <Controls />
-            <Background gap={20} />
+            <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} color="#d3ddf1" />
           </ReactFlow>
         </section>
         {showInspector && (
@@ -2601,7 +2893,7 @@ function App() {
       )}
 
       {activeMenu === 'Scenarios' && viewMode === 'library' && (
-        <main className="libraryWorkspace">
+        <main className="libraryWorkspace dashboardWorkspaceHero scenarioWorkspaceHero">
           <section className="libraryToolbar">
             <button type="button" className="primary" onClick={newJourney}>
               + New Journey
@@ -2695,39 +2987,58 @@ function App() {
         </main>
       )}
       {activeMenu === 'Catalogues' && (
-        <main className="dashboardWorkspace">
-          <section className="dashboardHeader">
-            <h2>Catalogues</h2>
+        <main className="dashboardWorkspace dashboardWorkspaceHero">
+          <section className="dashboardHeader dashboardHero">
+            <div>
+              <h2>Catalogues</h2>
+              <small>Event, segment, template ve endpoint katalog yonetimi</small>
+            </div>
             <button type="button" onClick={fetchCatalogues} disabled={cataloguesLoading}>
               {cataloguesLoading ? 'Yukleniyor...' : 'Yenile'}
             </button>
           </section>
 
-          <section className="dashboardGrid">
-            <article className="kpiCard">
-              <h3>Event Types</h3>
-              <div className="kpiValue">{catalogueSummary?.event_types?.total ?? 0}</div>
-              <small>Aktif: {catalogueSummary?.event_types?.active_total ?? 0}</small>
-            </article>
-            <article className="kpiCard">
-              <h3>Templates</h3>
-              <div className="kpiValue">{catalogueSummary?.templates?.total ?? 0}</div>
-              <small>Aktif: {catalogueSummary?.templates?.active_total ?? 0}</small>
-            </article>
-            <article className="kpiCard">
-              <h3>Endpoints</h3>
-              <div className="kpiValue">{catalogueSummary?.endpoints?.total ?? 0}</div>
-              <small>Aktif: {catalogueSummary?.endpoints?.active_total ?? 0}</small>
-            </article>
-            <article className="kpiCard">
-              <h3>Segments</h3>
-              <div className="kpiValue">{catalogueSummary?.segments?.total ?? 0}</div>
-              <small>Aktif: {catalogueSummary?.segments?.active_total ?? 0}</small>
-            </article>
+          <section className="dashboardTabs">
+            {CATALOGUE_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                className={catalogueTab === tab.id ? 'dashboardTab active' : 'dashboardTab'}
+                onClick={() => setCatalogueTab(tab.id)}
+              >
+                {tab.label}
+              </button>
+            ))}
           </section>
 
+          {catalogueTab === 'overview' && (
+            <section className="dashboardGrid">
+              <article className="kpiCard dashboardCard">
+                <h3>Event Types</h3>
+                <div className="kpiValue">{catalogueSummary?.event_types?.total ?? 0}</div>
+                <small>Aktif: {catalogueSummary?.event_types?.active_total ?? 0}</small>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <h3>Templates</h3>
+                <div className="kpiValue">{catalogueSummary?.templates?.total ?? 0}</div>
+                <small>Aktif: {catalogueSummary?.templates?.active_total ?? 0}</small>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <h3>Endpoints</h3>
+                <div className="kpiValue">{catalogueSummary?.endpoints?.total ?? 0}</div>
+                <small>Aktif: {catalogueSummary?.endpoints?.active_total ?? 0}</small>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <h3>Segments</h3>
+                <div className="kpiValue">{catalogueSummary?.segments?.total ?? 0}</div>
+                <small>Aktif: {catalogueSummary?.segments?.active_total ?? 0}</small>
+              </article>
+            </section>
+          )}
+
           <section className="catalogueSection">
-            <article className="kpiCard">
+            {catalogueTab === 'events' && (
+            <article className="kpiCard dashboardCard">
               <h3>Event Type Catalogue</h3>
               <div className="catalogueFormGrid">
                 <label>
@@ -2858,8 +3169,10 @@ function App() {
                 </table>
               </div>
             </article>
+            )}
 
-            <article className="kpiCard">
+            {catalogueTab === 'segments' && (
+            <article className="kpiCard dashboardCard">
               <h3>Segment Catalogue</h3>
               <div className="catalogueFormGrid">
                 <label>
@@ -2957,8 +3270,10 @@ function App() {
                 </table>
               </div>
             </article>
+            )}
 
-            <article className="kpiCard">
+            {catalogueTab === 'templates' && (
+            <article className="kpiCard dashboardCard">
               <h3>Template Catalogue</h3>
               <div className="catalogueFormGrid">
                 <label>
@@ -3063,8 +3378,10 @@ function App() {
                 </table>
               </div>
             </article>
+            )}
 
-            <article className="kpiCard">
+            {catalogueTab === 'endpoints' && (
+            <article className="kpiCard dashboardCard">
               <h3>Endpoint Catalogue</h3>
               <div className="catalogueFormGrid">
                 <label>
@@ -3184,11 +3501,12 @@ function App() {
                 </table>
               </div>
             </article>
+            )}
           </section>
         </main>
       )}
       {activeMenu === 'Dashboards' && (
-        <main className="dashboardWorkspace">
+        <main className="dashboardWorkspace dashboardWorkspaceHero">
           <section className="dashboardHeader dashboardHero">
             <div>
               <h2>Genel Durum KPI</h2>
@@ -3212,221 +3530,250 @@ function App() {
             <span className="dashboardChip">Veri araligi: 1s / 24s</span>
             <span className="dashboardChip">Son yenileme: {dashboardLastUpdated || '-'}</span>
           </section>
-          <section className="dashboardGrid">
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">EV</span>
-                <h3>Event Sayisi</h3>
-              </div>
-              <div className="kpiValue">{dashboardKpi?.events_1h ?? 0}</div>
-              <small>Son 1 saat</small>
-              <div className="kpiSub">24s: {dashboardKpi?.events_24h ?? 0}</div>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">IN</span>
-                <h3>Aktif Instance</h3>
-              </div>
-              <div className="kpiValue">{dashboardKpi?.active_instances?.total ?? 0}</div>
-              <small>waiting + waiting_manual + processing</small>
-              <div className="kpiSub">
-                w:{dashboardKpi?.active_instances?.waiting ?? 0} | wm:{dashboardKpi?.active_instances?.waiting_manual ?? 0} | p:{dashboardKpi?.active_instances?.processing ?? 0}
-              </div>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">CM</span>
-                <h3>Tamamlanan Journey</h3>
-              </div>
-              <div className="kpiValue">{dashboardKpi?.completed_journeys_24h ?? 0}</div>
-              <small>Son 24 saat completed instance</small>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">AC</span>
-                <h3>Action Orani (24s)</h3>
-              </div>
-              <div className="kpiValue">{dashboardKpi?.actions_24h?.success_rate_pct ?? 0}%</div>
-              <small>Basarili oran</small>
-              <div className="dashboardProgress">
-                <span
-                  className="dashboardProgressFill"
-                  style={{ width: `${Math.max(0, Math.min(100, Number(dashboardKpi?.actions_24h?.success_rate_pct ?? 0)))}%` }}
-                />
-              </div>
-              <div className="kpiSub">
-                fail: {dashboardKpi?.actions_24h?.failure_rate_pct ?? 0}% | ok:{' '}
-                {dashboardKpi?.actions_24h?.success ?? 0} / fail:{' '}
-                {dashboardKpi?.actions_24h?.failed ?? 0}
-              </div>
-            </article>
+          <section className="dashboardTabs">
+            {DASHBOARD_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                className={dashboardTab === tab.id ? 'dashboardTab active' : 'dashboardTab'}
+                onClick={() => setDashboardTab(tab.id)}
+              >
+                {tab.label}
+              </button>
+            ))}
           </section>
-          <section className="dashboardGrid">
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">CH</span>
-                <h3>Cache Dataset</h3>
-              </div>
-              <div className="kpiValue">{dashboardCacheHealth?.summary?.datasets_total ?? 0}</div>
-              <small>Toplam tanimli dataset</small>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">TD</span>
-                <h3>Bugun Yuklenen</h3>
-              </div>
-              <div className="kpiValue">{dashboardCacheHealth?.summary?.datasets_loaded_today ?? 0}</div>
-              <small>Bugun en az 1 basarili yukleme alan dataset</small>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">RN</span>
-                <h3>Bugun Basarili Run</h3>
-              </div>
-              <div className="kpiValue">{dashboardCacheHealth?.summary?.success_runs_today ?? 0}</div>
-              <small>Cache loader bugun success run sayisi</small>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <div className="dashboardCardHead">
-                <span className="dashboardIcon">RW</span>
-                <h3>Son Satir Toplami</h3>
-              </div>
-              <div className="kpiValue">{dashboardCacheHealth?.summary?.total_rows_last_success ?? 0}</div>
-              <small>Tum datasetlerin son basarili row_count toplami</small>
-            </article>
-          </section>
-          <section className="dashboardSplit">
-            <article className="kpiCard dashboardCard">
-              <h3>En Cok Event Alan Journey</h3>
-              <div className="dashboardList">
-                {(dashboardJourneyPerf?.top_by_events || []).map((item, index) => (
-                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow dashboardRankRow">
-                    <span className="dashboardRank">{index + 1}</span>
-                    <span className="dashboardRankName">{item.name}</span>
-                    <strong>{item.triggered_24h}</strong>
-                    <span
-                      className="dashboardMiniBar"
-                      style={{
-                        width: `${Math.max(
-                          12,
-                          Math.round((Number(item.triggered_24h || 0) / topEventMax) * 100)
-                        )}%`
-                      }}
-                    />
+
+          {dashboardTab === 'kpi' && (
+            <section className="dashboardGrid">
+              <article className="kpiCard dashboardCard">
+                <div className="dashboardCardHead">
+                  <span className="dashboardIcon">EV</span>
+                  <h3>Event Sayisi</h3>
+                </div>
+                <div className="kpiValue">{dashboardKpi?.events_1h ?? 0}</div>
+                <small>Son 1 saat</small>
+                <div className="kpiSub">24s: {dashboardKpi?.events_24h ?? 0}</div>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <div className="dashboardCardHead">
+                  <span className="dashboardIcon">IN</span>
+                  <h3>Aktif Instance</h3>
+                </div>
+                <div className="kpiValue">{dashboardKpi?.active_instances?.total ?? 0}</div>
+                <small>waiting + waiting_manual + processing</small>
+                <div className="kpiSub">
+                  w:{dashboardKpi?.active_instances?.waiting ?? 0} | wm:{dashboardKpi?.active_instances?.waiting_manual ?? 0} | p:{dashboardKpi?.active_instances?.processing ?? 0}
+                </div>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <div className="dashboardCardHead">
+                  <span className="dashboardIcon">CM</span>
+                  <h3>Tamamlanan Journey</h3>
+                </div>
+                <div className="kpiValue">{dashboardKpi?.completed_journeys_24h ?? 0}</div>
+                <small>Son 24 saat completed instance</small>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <div className="dashboardCardHead">
+                  <span className="dashboardIcon">AC</span>
+                  <h3>Action Orani (24s)</h3>
+                </div>
+                <div className="kpiValue">{dashboardKpi?.actions_24h?.success_rate_pct ?? 0}%</div>
+                <small>Basarili oran</small>
+                <div className="dashboardProgress">
+                  <span
+                    className="dashboardProgressFill"
+                    style={{ width: `${Math.max(0, Math.min(100, Number(dashboardKpi?.actions_24h?.success_rate_pct ?? 0)))}%` }}
+                  />
+                </div>
+                <div className="kpiSub">
+                  fail: {dashboardKpi?.actions_24h?.failure_rate_pct ?? 0}% | ok:{' '}
+                  {dashboardKpi?.actions_24h?.success ?? 0} / fail:{' '}
+                  {dashboardKpi?.actions_24h?.failed ?? 0}
+                </div>
+              </article>
+            </section>
+          )}
+
+          {dashboardTab === 'top' && (
+            <section className="dashboardSplit">
+              <article className="kpiCard dashboardCard">
+                <h3>En Cok Event Alan Journey</h3>
+                <div className="dashboardList">
+                  {(dashboardJourneyPerf?.top_by_events || []).map((item, index) => (
+                    <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow dashboardRankRow">
+                      <span className="dashboardRank">{index + 1}</span>
+                      <span className="dashboardRankName">{item.name}</span>
+                      <strong>{item.triggered_24h}</strong>
+                      <span
+                        className="dashboardMiniBar"
+                        style={{
+                          width: `${Math.max(
+                            12,
+                            Math.round((Number(item.triggered_24h || 0) / topEventMax) * 100)
+                          )}%`
+                        }}
+                      />
+                    </div>
+                  ))}
+                  {(dashboardJourneyPerf?.top_by_events || []).length === 0 && (
+                    <small>Veri yok.</small>
+                  )}
+                </div>
+              </article>
+              <article className="kpiCard dashboardCard">
+                <h3>En Cok Fail Ureten Journey</h3>
+                <div className="dashboardList">
+                  {(dashboardJourneyPerf?.top_by_failures || []).map((item, index) => (
+                    <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow dashboardRankRow fail">
+                      <span className="dashboardRank">{index + 1}</span>
+                      <span className="dashboardRankName">{item.name}</span>
+                      <strong>{item.failed_actions_24h}</strong>
+                      <span
+                        className="dashboardMiniBar fail"
+                        style={{
+                          width: `${Math.max(
+                            12,
+                            Math.round((Number(item.failed_actions_24h || 0) / topFailMax) * 100)
+                          )}%`
+                        }}
+                      />
+                    </div>
+                  ))}
+                  {(dashboardJourneyPerf?.top_by_failures || []).length === 0 && (
+                    <small>Veri yok.</small>
+                  )}
+                </div>
+              </article>
+            </section>
+          )}
+
+          {dashboardTab === 'cache' && (
+            <>
+              <section className="dashboardGrid">
+                <article className="kpiCard dashboardCard">
+                  <div className="dashboardCardHead">
+                    <span className="dashboardIcon">CH</span>
+                    <h3>Cache Dataset</h3>
                   </div>
-                ))}
-                {(dashboardJourneyPerf?.top_by_events || []).length === 0 && (
-                  <small>Veri yok.</small>
-                )}
-              </div>
-            </article>
-            <article className="kpiCard dashboardCard">
-              <h3>En Cok Fail Ureten Journey</h3>
-              <div className="dashboardList">
-                {(dashboardJourneyPerf?.top_by_failures || []).map((item, index) => (
-                  <div key={`${item.journey_id}::${item.journey_version}`} className="dashboardListRow dashboardRankRow fail">
-                    <span className="dashboardRank">{index + 1}</span>
-                    <span className="dashboardRankName">{item.name}</span>
-                    <strong>{item.failed_actions_24h}</strong>
-                    <span
-                      className="dashboardMiniBar fail"
-                      style={{
-                        width: `${Math.max(
-                          12,
-                          Math.round((Number(item.failed_actions_24h || 0) / topFailMax) * 100)
-                        )}%`
-                      }}
-                    />
+                  <div className="kpiValue">{dashboardCacheHealth?.summary?.datasets_total ?? 0}</div>
+                  <small>Toplam tanimli dataset</small>
+                </article>
+                <article className="kpiCard dashboardCard">
+                  <div className="dashboardCardHead">
+                    <span className="dashboardIcon">TD</span>
+                    <h3>Bugun Yuklenen</h3>
                   </div>
-                ))}
-                {(dashboardJourneyPerf?.top_by_failures || []).length === 0 && (
-                  <small>Veri yok.</small>
-                )}
+                  <div className="kpiValue">{dashboardCacheHealth?.summary?.datasets_loaded_today ?? 0}</div>
+                  <small>Bugun en az 1 basarili yukleme alan dataset</small>
+                </article>
+                <article className="kpiCard dashboardCard">
+                  <div className="dashboardCardHead">
+                    <span className="dashboardIcon">RN</span>
+                    <h3>Bugun Basarili Run</h3>
+                  </div>
+                  <div className="kpiValue">{dashboardCacheHealth?.summary?.success_runs_today ?? 0}</div>
+                  <small>Cache loader bugun success run sayisi</small>
+                </article>
+                <article className="kpiCard dashboardCard">
+                  <div className="dashboardCardHead">
+                    <span className="dashboardIcon">RW</span>
+                    <h3>Son Satir Toplami</h3>
+                  </div>
+                  <div className="kpiValue">{dashboardCacheHealth?.summary?.total_rows_last_success ?? 0}</div>
+                  <small>Tum datasetlerin son basarili row_count toplami</small>
+                </article>
+              </section>
+              <section className="dashboardTableWrap dashboardTableCard">
+                <div className="dashboardTableHead">
+                  <h3>Cache Health Detay</h3>
+                  <small>Dataset bazinda son yukleme durumu ve bugun yuklenme bilgisi</small>
+                </div>
+                <table className="journeyLogsTable">
+                  <thead>
+                    <tr>
+                      <th>Dataset</th>
+                      <th>Bugun Yuklendi mi</th>
+                      <th>Son Basarili Yukleme</th>
+                      <th>Son Basarili Satir</th>
+                      <th>Son Run Status</th>
+                      <th>Son Run Tarihi</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(dashboardCacheHealth?.items || []).map((item) => (
+                      <tr key={item.dataset_key}>
+                        <td>{item.dataset_key}</td>
+                        <td>{item.loaded_today ? 'Evet' : 'Hayir'}</td>
+                        <td>{formatLogDate(item.last_success_at)}</td>
+                        <td>{item.last_success_row_count ?? 0}</td>
+                        <td>{item.last_run_status || '-'}</td>
+                        <td>{formatLogDate(item.last_run_at)}</td>
+                      </tr>
+                    ))}
+                    {(dashboardCacheHealth?.items || []).length === 0 && (
+                      <tr>
+                        <td colSpan={6}>Cache dataset verisi yok.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </section>
+            </>
+          )}
+
+          {dashboardTab === 'perf' && (
+            <section className="dashboardTableWrap dashboardTableCard">
+              <div className="dashboardTableHead">
+                <h3>Journey Bazli Performans</h3>
+                <small>Tetiklenme, completion, fail ve ortalama bekleme suresi</small>
               </div>
-            </article>
-          </section>
-          <section className="dashboardTableWrap dashboardTableCard">
-            <div className="dashboardTableHead">
-              <h3>Cache Health Detay</h3>
-              <small>Dataset bazinda son yukleme durumu ve bugun yuklenme bilgisi</small>
-            </div>
-            <table className="journeyLogsTable">
-              <thead>
-                <tr>
-                  <th>Dataset</th>
-                  <th>Bugun Yuklendi mi</th>
-                  <th>Son Basarili Yukleme</th>
-                  <th>Son Basarili Satir</th>
-                  <th>Son Run Status</th>
-                  <th>Son Run Tarihi</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(dashboardCacheHealth?.items || []).map((item) => (
-                  <tr key={item.dataset_key}>
-                    <td>{item.dataset_key}</td>
-                    <td>{item.loaded_today ? 'Evet' : 'Hayir'}</td>
-                    <td>{formatLogDate(item.last_success_at)}</td>
-                    <td>{item.last_success_row_count ?? 0}</td>
-                    <td>{item.last_run_status || '-'}</td>
-                    <td>{formatLogDate(item.last_run_at)}</td>
-                  </tr>
-                ))}
-                {(dashboardCacheHealth?.items || []).length === 0 && (
+              <table className="journeyLogsTable">
+                <thead>
                   <tr>
-                    <td colSpan={6}>Cache dataset verisi yok.</td>
+                    <th>Journey</th>
+                    <th>Version</th>
+                    <th>Tetiklenme (24s)</th>
+                    <th>Completion (24s)</th>
+                    <th>Fail (24s)</th>
+                    <th>Ort. Bekleme</th>
                   </tr>
-                )}
-              </tbody>
-            </table>
-          </section>
-          <section className="dashboardTableWrap dashboardTableCard">
-            <div className="dashboardTableHead">
-              <h3>Journey Bazli Performans</h3>
-              <small>Tetiklenme, completion, fail ve ortalama bekleme suresi</small>
-            </div>
-            <table className="journeyLogsTable">
-              <thead>
-                <tr>
-                  <th>Journey</th>
-                  <th>Version</th>
-                  <th>Tetiklenme (24s)</th>
-                  <th>Completion (24s)</th>
-                  <th>Fail (24s)</th>
-                  <th>Ort. Bekleme</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(dashboardJourneyPerf?.journeys || []).map((item) => (
-                  <tr key={`${item.journey_id}::${item.journey_version}`}>
-                    <td>{item.name}</td>
-                    <td>{item.journey_version}</td>
-                    <td>{item.triggered_24h}</td>
-                    <td>{item.completed_24h}</td>
-                    <td>{item.failed_actions_24h}</td>
-                    <td>{formatDurationMinutes(item.avg_wait_seconds)}</td>
-                  </tr>
-                ))}
-                {(dashboardJourneyPerf?.journeys || []).length === 0 && (
-                  <tr>
-                    <td colSpan={6}>Journey performans verisi yok.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </section>
+                </thead>
+                <tbody>
+                  {(dashboardJourneyPerf?.journeys || []).map((item) => (
+                    <tr key={`${item.journey_id}::${item.journey_version}`}>
+                      <td>{item.name}</td>
+                      <td>{item.journey_version}</td>
+                      <td>{item.triggered_24h}</td>
+                      <td>{item.completed_24h}</td>
+                      <td>{item.failed_actions_24h}</td>
+                      <td>{formatDurationMinutes(item.avg_wait_seconds)}</td>
+                    </tr>
+                  ))}
+                  {(dashboardJourneyPerf?.journeys || []).length === 0 && (
+                    <tr>
+                      <td colSpan={6}>Journey performans verisi yok.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+          )}
         </main>
       )}
       {activeMenu === 'Management' && (
-        <main className="dashboardWorkspace">
-          <section className="dashboardHeader">
-            <h2>Release Control</h2>
+        <main className="dashboardWorkspace dashboardWorkspaceHero">
+          <section className="dashboardHeader dashboardHero">
+            <div>
+              <h2>Release Control</h2>
+              <small>Canli trafik kontrolu ve global operasyon ayarlari</small>
+            </div>
             <button type="button" onClick={fetchManagementData} disabled={managementLoading}>
               {managementLoading ? 'Yukleniyor...' : 'Yenile'}
             </button>
           </section>
 
-          <section className="kpiCard">
+          <section className="kpiCard dashboardCard">
             <h3>Bakim Modu / Global Pause</h3>
             <div className="manualQueueToolbar">
               <label>
@@ -3444,7 +3791,11 @@ function App() {
             <small>Aktif olunca yeni eventler ve scheduler akisi durdurulur.</small>
           </section>
 
-          <section className="dashboardTableWrap">
+          <section className="dashboardTableWrap dashboardTableCard">
+            <div className="dashboardTableHead">
+              <h3>Journey Release Controls</h3>
+              <small>Journey bazinda trafik orani ve pause ayarlari</small>
+            </div>
             <table className="journeyLogsTable">
               <thead>
                 <tr>

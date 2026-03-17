@@ -45,6 +45,18 @@ const JourneyMoveFolderSchema = z.object({
   target_folder_path: z.string().min(1)
 });
 
+const JourneyApprovalRequestSchema = z.object({
+  version: z.number().int().positive().optional(),
+  requested_by: z.string().min(1).default('ui'),
+  note: z.string().default('')
+});
+
+const JourneyApprovalDecisionSchema = z.object({
+  version: z.number().int().positive().optional(),
+  reviewed_by: z.string().min(1).default('ui'),
+  note: z.string().default('')
+});
+
 const CustomerProfileSchema = z.object({
   segment: z.string().nullable().optional(),
   attributes: z.record(z.any()).default({})
@@ -452,6 +464,27 @@ async function ensureSchema() {
       updated_at timestamptz not null default now(),
       primary key (journey_id, journey_version)
     )
+  `);
+
+  await pgClient.query(`
+    create table if not exists journey_approvals (
+      journey_id text not null,
+      journey_version int not null,
+      state text not null,
+      requested_by text,
+      requested_note text not null default '',
+      requested_at timestamptz,
+      reviewed_by text,
+      reviewed_note text not null default '',
+      reviewed_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      primary key (journey_id, journey_version)
+    )
+  `);
+  await pgClient.query(`
+    create index if not exists idx_journey_approvals_state_updated
+      on journey_approvals (state, updated_at desc)
   `);
 
   await pgClient.query(`
@@ -1560,6 +1593,23 @@ app.post('/ingest', async (req, res) => {
 app.post('/journeys', async (req, res) => {
   try {
     const input = JourneyCreateSchema.parse(req.body);
+    if (input.status === 'published') {
+      const approval = await pgClient.query(
+        `select state
+         from journey_approvals
+         where journey_id = $1 and journey_version = $2
+         limit 1`,
+        [input.journey_id, input.version]
+      );
+      const state = String(approval.rows[0]?.state || '');
+      if (state !== 'approved') {
+        res.status(403).json({
+          status: 'error',
+          message: 'publish requires approval: request and approve this version first'
+        });
+        return;
+      }
+    }
     await pgClient.query(
       `insert into journey_folders (folder_path)
        values ($1)
@@ -1582,6 +1632,262 @@ app.post('/journeys', async (req, res) => {
     res.status(200).json({ status: 'ok', journey_id: input.journey_id, version: input.version });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/journeys/:journeyId/approval', async (req, res) => {
+  try {
+    const journeyId = req.params.journeyId;
+    const version = await resolveJourneyVersion(journeyId, req.query.version);
+    const result = await pgClient.query(
+      `select journey_id, journey_version, state, requested_by, requested_note, requested_at,
+              reviewed_by, reviewed_note, reviewed_at, updated_at
+       from journey_approvals
+       where journey_id = $1 and journey_version = $2
+       limit 1`,
+      [journeyId, version]
+    );
+    res.status(200).json({
+      status: 'ok',
+      item:
+        result.rows[0] || {
+          journey_id: journeyId,
+          journey_version: version,
+          state: 'none',
+          requested_by: null,
+          requested_note: '',
+          requested_at: null,
+          reviewed_by: null,
+          reviewed_note: '',
+          reviewed_at: null,
+          updated_at: null
+        }
+    });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/journeys/:journeyId/request-approval', async (req, res) => {
+  try {
+    const journeyId = req.params.journeyId;
+    const payload = JourneyApprovalRequestSchema.parse(req.body || {});
+    const version = await resolveJourneyVersion(journeyId, payload.version);
+    const exists = await pgClient.query(
+      `select 1
+       from journeys
+       where journey_id = $1 and version = $2
+       limit 1`,
+      [journeyId, version]
+    );
+    if (exists.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'journey version not found' });
+      return;
+    }
+
+    await pgClient.query(
+      `insert into journey_approvals
+        (journey_id, journey_version, state, requested_by, requested_note, requested_at, updated_at)
+       values ($1, $2, 'pending', $3, $4, now(), now())
+       on conflict (journey_id, journey_version)
+       do update set
+         state = 'pending',
+         requested_by = excluded.requested_by,
+         requested_note = excluded.requested_note,
+         requested_at = now(),
+         reviewed_by = null,
+         reviewed_note = '',
+         reviewed_at = null,
+         updated_at = now()`,
+      [journeyId, version, payload.requested_by, payload.note || '']
+    );
+
+    await pgClient.query(
+      `update journeys
+       set status = 'draft', updated_at = now()
+       where journey_id = $1 and version = $2`,
+      [journeyId, version]
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      item: { journey_id: journeyId, journey_version: version, state: 'pending' }
+    });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/journeys/:journeyId/approve', async (req, res) => {
+  try {
+    const journeyId = req.params.journeyId;
+    const payload = JourneyApprovalDecisionSchema.parse(req.body || {});
+    const version = await resolveJourneyVersion(journeyId, payload.version);
+
+    await pgClient.query(
+      `insert into journey_approvals
+        (journey_id, journey_version, state, reviewed_by, reviewed_note, reviewed_at, updated_at)
+       values ($1, $2, 'approved', $3, $4, now(), now())
+       on conflict (journey_id, journey_version)
+       do update set
+         state = 'approved',
+         reviewed_by = excluded.reviewed_by,
+         reviewed_note = excluded.reviewed_note,
+         reviewed_at = now(),
+         updated_at = now()`,
+      [journeyId, version, payload.reviewed_by, payload.note || '']
+    );
+
+    await pgClient.query(
+      `update journeys
+       set status = 'published', updated_at = now()
+       where journey_id = $1 and version = $2`,
+      [journeyId, version]
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      item: { journey_id: journeyId, journey_version: version, state: 'approved' }
+    });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/journeys/:journeyId/reject', async (req, res) => {
+  try {
+    const journeyId = req.params.journeyId;
+    const payload = JourneyApprovalDecisionSchema.parse(req.body || {});
+    const version = await resolveJourneyVersion(journeyId, payload.version);
+
+    await pgClient.query(
+      `insert into journey_approvals
+        (journey_id, journey_version, state, reviewed_by, reviewed_note, reviewed_at, updated_at)
+       values ($1, $2, 'rejected', $3, $4, now(), now())
+       on conflict (journey_id, journey_version)
+       do update set
+         state = 'rejected',
+         reviewed_by = excluded.reviewed_by,
+         reviewed_note = excluded.reviewed_note,
+         reviewed_at = now(),
+         updated_at = now()`,
+      [journeyId, version, payload.reviewed_by, payload.note || '']
+    );
+
+    await pgClient.query(
+      `update journeys
+       set status = 'draft', updated_at = now()
+       where journey_id = $1 and version = $2`,
+      [journeyId, version]
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      item: { journey_id: journeyId, journey_version: version, state: 'rejected' }
+    });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/journeys/:journeyId/diff', async (req, res) => {
+  try {
+    const journeyId = req.params.journeyId;
+    const fromVersion = Number(req.query.from_version);
+    const toVersion = Number(req.query.to_version);
+    if (!Number.isInteger(fromVersion) || fromVersion <= 0) {
+      res.status(400).json({ status: 'error', message: 'invalid from_version' });
+      return;
+    }
+    if (!Number.isInteger(toVersion) || toVersion <= 0) {
+      res.status(400).json({ status: 'error', message: 'invalid to_version' });
+      return;
+    }
+    if (fromVersion === toVersion) {
+      res.status(400).json({ status: 'error', message: 'versions must be different' });
+      return;
+    }
+
+    const versions = await pgClient.query(
+      `select version, graph_json
+       from journeys
+       where journey_id = $1 and version in ($2, $3)`,
+      [journeyId, fromVersion, toVersion]
+    );
+    if (versions.rowCount !== 2) {
+      res.status(404).json({ status: 'error', message: 'one or both versions not found' });
+      return;
+    }
+
+    const byVersion = new Map(versions.rows.map((row) => [Number(row.version), row.graph_json || {}]));
+    const fromGraph = byVersion.get(fromVersion) || {};
+    const toGraph = byVersion.get(toVersion) || {};
+    const fromNodes = Array.isArray(fromGraph.nodes) ? fromGraph.nodes : [];
+    const toNodes = Array.isArray(toGraph.nodes) ? toGraph.nodes : [];
+    const fromEdges = Array.isArray(fromGraph.edges) ? fromGraph.edges : [];
+    const toEdges = Array.isArray(toGraph.edges) ? toGraph.edges : [];
+
+    const fromNodeMap = new Map(fromNodes.map((node) => [String(node.id), node]));
+    const toNodeMap = new Map(toNodes.map((node) => [String(node.id), node]));
+    const fromEdgeMap = new Map(fromEdges.map((edge) => [String(edge.id), edge]));
+    const toEdgeMap = new Map(toEdges.map((edge) => [String(edge.id), edge]));
+
+    const canonicalNode = (node) =>
+      JSON.stringify({
+        id: node?.id || '',
+        type: node?.type || null,
+        data: node?.data || {}
+      });
+    const canonicalEdge = (edge) =>
+      JSON.stringify({
+        id: edge?.id || '',
+        source: edge?.source || '',
+        target: edge?.target || '',
+        data: edge?.data || {}
+      });
+
+    const addedNodeIds = [...toNodeMap.keys()].filter((id) => !fromNodeMap.has(id));
+    const removedNodeIds = [...fromNodeMap.keys()].filter((id) => !toNodeMap.has(id));
+    const changedNodeIds = [...toNodeMap.keys()].filter(
+      (id) => fromNodeMap.has(id) && canonicalNode(fromNodeMap.get(id)) !== canonicalNode(toNodeMap.get(id))
+    );
+
+    const addedEdgeIds = [...toEdgeMap.keys()].filter((id) => !fromEdgeMap.has(id));
+    const removedEdgeIds = [...fromEdgeMap.keys()].filter((id) => !toEdgeMap.has(id));
+    const changedEdgeIds = [...toEdgeMap.keys()].filter(
+      (id) => fromEdgeMap.has(id) && canonicalEdge(fromEdgeMap.get(id)) !== canonicalEdge(toEdgeMap.get(id))
+    );
+
+    res.status(200).json({
+      status: 'ok',
+      item: {
+        journey_id: journeyId,
+        from_version: fromVersion,
+        to_version: toVersion,
+        summary: {
+          from_nodes: fromNodes.length,
+          to_nodes: toNodes.length,
+          from_edges: fromEdges.length,
+          to_edges: toEdges.length,
+          added_nodes: addedNodeIds.length,
+          removed_nodes: removedNodeIds.length,
+          changed_nodes: changedNodeIds.length,
+          added_edges: addedEdgeIds.length,
+          removed_edges: removedEdgeIds.length,
+          changed_edges: changedEdgeIds.length
+        },
+        detail: {
+          added_node_ids: addedNodeIds,
+          removed_node_ids: removedNodeIds,
+          changed_node_ids: changedNodeIds,
+          added_edge_ids: addedEdgeIds,
+          removed_edge_ids: removedEdgeIds,
+          changed_edge_ids: changedEdgeIds
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
   }
 });
 

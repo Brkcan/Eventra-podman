@@ -57,6 +57,11 @@ body {
   gap: 6px;
 }
 
+.navGroup {
+  display: grid;
+  gap: 6px;
+}
+
 .navItem {
   text-align: left;
   width: 100%;
@@ -71,6 +76,30 @@ body {
   background: rgba(255, 255, 255, 0.14);
   border-color: rgba(255, 255, 255, 0.26);
   color: #fff;
+}
+
+.navSubmenu {
+  display: grid;
+  gap: 6px;
+  padding: 2px 0 4px 8px;
+}
+
+.navSubItem {
+  text-align: left;
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  padding: 7px 9px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #d7e6ff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.navSubItem.active {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.34);
+  color: #ffffff;
 }
 
 .page {
@@ -109,6 +138,22 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
+}
+
+.designerActions button.active {
+  background: linear-gradient(180deg, #ffe7cc, #ffd3aa);
+  border-color: #d68b44;
+}
+
+.designerActionPanel {
+  margin: 10px 12px 0;
+  padding: 10px 12px;
+  border: 1px solid #c7d7f1;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.92);
+  display: flex;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
@@ -364,6 +409,17 @@ button:disabled {
   justify-content: flex-end;
 }
 
+.nodePalette {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  width: 100%;
+  justify-content: flex-end;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed #c5d6ef;
+}
+
 .canvasTools button {
   height: 30px;
   padding: 0 9px;
@@ -398,44 +454,95 @@ button:disabled {
 
 .canvas .react-flow__node {
   border-radius: 12px;
-  border: 1px solid #d4b088;
-  background: linear-gradient(160deg, #fffaf2, #f7ebd8);
-  color: #412d17;
+  border: 1px solid #c8d8f0;
+  background: linear-gradient(165deg, #ffffff, #eef4ff);
+  color: #1f3762;
   font-weight: 700;
-  box-shadow: 0 9px 14px -12px rgba(65, 40, 17, 0.75);
+  box-shadow: 0 14px 18px -16px rgba(16, 54, 114, 0.88);
   min-width: 170px;
+  padding: 8px 10px;
 }
 
 .canvas .react-flow__node.selected,
 .canvas .react-flow__node:focus {
-  border-color: #cd7b35;
+  border-color: #4e83da;
   box-shadow:
-    0 0 0 3px rgba(205, 123, 53, 0.18),
-    0 9px 14px -12px rgba(65, 40, 17, 0.75);
+    0 0 0 4px rgba(78, 131, 218, 0.18),
+    0 14px 18px -16px rgba(16, 54, 114, 0.88);
 }
 
 .canvas .react-flow__handle {
   width: 9px;
   height: 9px;
-  border: 1px solid #f5e2c8;
-  background: #b96622;
+  border: 1px solid #e7effc;
+  background: #4a7dd4;
 }
 
 .canvas .react-flow__edge-path {
-  stroke: #b37b45;
-  stroke-width: 2.1;
+  stroke: #5d84ca;
+  stroke-width: 2.3;
 }
 
 .canvas .react-flow__edge.selected .react-flow__edge-path {
-  stroke: #c24f3d;
+  stroke: #ef6f4b;
+}
+
+.canvas .react-flow__edge .react-flow__edge-path {
+  stroke-dasharray: 5 4;
+}
+
+.canvas .react-flow__node.node-trigger {
+  border-color: #9ec4ff;
+  background: linear-gradient(165deg, #f5f9ff, #e7f0ff);
+}
+
+.canvas .react-flow__node.node-wait {
+  border-color: #86ded5;
+  background: linear-gradient(165deg, #f3fffd, #ddf9f5);
+}
+
+.canvas .react-flow__node.node-cache_lookup {
+  border-color: #c8b0ff;
+  background: linear-gradient(165deg, #faf7ff, #eee6ff);
+}
+
+.canvas .react-flow__node.node-http_call {
+  border-color: #f3c67f;
+  background: linear-gradient(165deg, #fffaf2, #ffefd8);
+}
+
+.canvas .react-flow__node.node-condition {
+  border-color: #ffb5ab;
+  background: linear-gradient(165deg, #fff7f6, #ffe9e6);
+}
+
+.canvas .react-flow__node.node-action {
+  border-color: #96e1b0;
+  background: linear-gradient(165deg, #f4fff8, #e1f9ea);
 }
 
 .canvas .react-flow__controls,
 .canvas .react-flow__minimap {
-  border: 1px solid #d9be9b;
-  border-radius: 10px;
+  border: 1px solid #bfd2ef;
+  border-radius: 12px;
   overflow: hidden;
-  box-shadow: 0 10px 18px -16px rgba(76, 40, 12, 0.7);
+  box-shadow: 0 14px 24px -22px rgba(15, 53, 115, 0.85);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.canvas .react-flow__minimap {
+  background: linear-gradient(180deg, rgba(232, 241, 255, 0.95), rgba(223, 236, 255, 0.9));
+}
+
+.canvas .react-flow__minimap .react-flow__minimap-node {
+  rx: 6;
+  ry: 6;
+}
+
+.canvas .react-flow__controls button {
+  background: linear-gradient(180deg, #ffffff, #eaf2ff);
+  border-bottom: 1px solid #d5e2f5;
+  color: #2e4e86;
 }
 
 .sidePanel {
@@ -552,6 +659,23 @@ button:disabled {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.dashboardTabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dashboardTab {
+  width: auto;
+  min-width: 140px;
+}
+
+.dashboardTab.active {
+  background: linear-gradient(180deg, var(--dash-primary), var(--dash-primary-2));
+  border-color: var(--dash-primary-2);
+  color: #fff;
 }
 
 .dashboardChip {
@@ -717,6 +841,173 @@ button:disabled {
   border-color: #d6aea8;
 }
 
+.dashboardWorkspaceHero {
+  background:
+    radial-gradient(circle at 8% 2%, rgba(255, 128, 0, 0.14), transparent 24%),
+    radial-gradient(circle at 90% 8%, rgba(16, 89, 214, 0.18), transparent 26%),
+    linear-gradient(180deg, #eef3fc 0%, #e9f0fb 100%);
+  border-radius: 16px;
+}
+
+.dashboardWorkspaceHero .dashboardHeader {
+  border: 1px solid #c7d7f1;
+  border-radius: 16px;
+  padding: 14px 16px;
+  background:
+    radial-gradient(circle at 86% 12%, rgba(255, 130, 0, 0.2), transparent 34%),
+    linear-gradient(135deg, #0f47b8 0%, #2468d3 48%, #3d84e8 100%);
+  color: #fff;
+  box-shadow: 0 18px 30px -24px rgba(8, 37, 94, 0.95);
+}
+
+.dashboardWorkspaceHero .dashboardHeader h2 {
+  color: #fff;
+  font-size: 26px;
+  letter-spacing: 0.2px;
+}
+
+.dashboardWorkspaceHero .dashboardHero small {
+  color: rgba(233, 243, 255, 0.92);
+  font-size: 13px;
+}
+
+.dashboardWorkspaceHero .dashboardMetaBar {
+  gap: 10px;
+}
+
+.dashboardWorkspaceHero .dashboardChip {
+  border-color: #c2d4f2;
+  background: rgba(255, 255, 255, 0.75);
+  color: #1d3767;
+  font-weight: 700;
+  box-shadow: 0 8px 18px -18px rgba(21, 56, 120, 0.95);
+}
+
+.dashboardWorkspaceHero .dashboardTabs {
+  gap: 10px;
+}
+
+.dashboardWorkspaceHero .dashboardTab {
+  border-radius: 999px;
+  border-color: #bacdea;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(239, 245, 255, 0.95));
+  color: #22447e;
+  font-weight: 700;
+  transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+}
+
+.dashboardWorkspaceHero .dashboardTab:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 18px -18px rgba(21, 56, 120, 0.95);
+  border-color: #9db9e5;
+}
+
+.dashboardWorkspaceHero .dashboardTab.active {
+  background: linear-gradient(135deg, #ff6f0f, #ff8b2a);
+  border-color: #e36409;
+  color: #fff;
+  box-shadow: 0 14px 24px -20px rgba(168, 66, 0, 0.95);
+}
+
+.dashboardWorkspaceHero .dashboardCard {
+  border: 1px solid #c9d7ee;
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(255, 123, 0, 0.1), transparent 44%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(244, 249, 255, 0.94));
+  padding: 14px;
+  box-shadow:
+    0 22px 34px -30px rgba(15, 53, 115, 0.88),
+    0 1px 0 rgba(255, 255, 255, 0.9) inset;
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.dashboardWorkspaceHero .dashboardCard:hover {
+  transform: translateY(-2px);
+  border-color: #adc5e9;
+  box-shadow:
+    0 26px 34px -28px rgba(15, 53, 115, 0.9),
+    0 1px 0 rgba(255, 255, 255, 0.92) inset;
+}
+
+.dashboardWorkspaceHero .dashboardCardHead h3 {
+  font-size: 22px;
+}
+
+.dashboardWorkspaceHero .dashboardIcon {
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  border-color: #c3d5f2;
+  background: linear-gradient(180deg, #fef4e8, #f8d4af);
+  color: #d65a00;
+  font-size: 11px;
+}
+
+.dashboardWorkspaceHero .kpiValue {
+  font-size: 44px;
+  line-height: 1;
+  color: #132b55;
+}
+
+.dashboardWorkspaceHero .kpiSub,
+.dashboardWorkspaceHero .kpiCard small {
+  color: #4f678f;
+}
+
+.dashboardWorkspaceHero .dashboardProgress {
+  border-color: #bfd2ef;
+  background: linear-gradient(180deg, #e4eefb, #d9e5f7);
+  height: 10px;
+}
+
+.dashboardWorkspaceHero .dashboardProgressFill {
+  background: linear-gradient(90deg, #ff750f, #ff9b42);
+}
+
+.dashboardWorkspaceHero .dashboardListRow {
+  border-color: #cdd9ee;
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(243, 248, 255, 0.95));
+}
+
+.dashboardWorkspaceHero .dashboardRank {
+  border-color: #bfd1ec;
+  background: linear-gradient(180deg, #ffffff, #ebf3ff);
+  color: #1f3f76;
+}
+
+.dashboardWorkspaceHero .dashboardMiniBar {
+  background: linear-gradient(90deg, #2f6fd8, #5aa0ff);
+}
+
+.dashboardWorkspaceHero .dashboardMiniBar.fail {
+  background: linear-gradient(90deg, #d44d3d, #ea7a52);
+}
+
+.dashboardWorkspaceHero .dashboardTableWrap {
+  border: 1px solid #c9d9ef;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 20px 30px -28px rgba(15, 53, 115, 0.78);
+}
+
+.dashboardWorkspaceHero .dashboardTableHead {
+  border-bottom: 1px solid #ccdbef;
+  background:
+    radial-gradient(circle at 0% 0%, rgba(255, 145, 0, 0.14), transparent 30%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(241, 247, 255, 0.96));
+}
+
+.dashboardWorkspaceHero .dashboardTableHead h3 {
+  color: #1d3c74;
+}
+
+.dashboardWorkspaceHero .dashboardTableCard .journeyLogsTable thead th {
+  background: #eaf2ff;
+  color: #1f3f76;
+}
+
 .dashboardTableCard {
   overflow: hidden;
 }
@@ -860,6 +1151,97 @@ button:disabled {
 .folderCard:hover {
   transform: translateY(-1px);
   border-color: #cfa87b;
+}
+
+.pageScenarios {
+  background:
+    radial-gradient(circle at 8% 2%, rgba(255, 128, 0, 0.08), transparent 28%),
+    radial-gradient(circle at 90% 8%, rgba(16, 89, 214, 0.12), transparent 30%),
+    linear-gradient(180deg, #eef3fc 0%, #e9f0fb 100%);
+}
+
+.pageScenarios .designerTop {
+  border: 1px solid #c7d7f1;
+  border-radius: 16px;
+  margin: 10px 12px 0;
+  padding: 14px 16px;
+  background:
+    radial-gradient(circle at 86% 12%, rgba(255, 130, 0, 0.2), transparent 34%),
+    linear-gradient(135deg, #0f47b8 0%, #2468d3 48%, #3d84e8 100%);
+  color: #fff;
+  box-shadow: 0 18px 30px -24px rgba(8, 37, 94, 0.95);
+}
+
+.pageScenarios .designerTitle strong {
+  color: #fff;
+}
+
+.pageScenarios .designerTitle span {
+  color: rgba(233, 243, 255, 0.92);
+}
+
+.pageScenarios .controlsBar {
+  margin: 10px 12px 0;
+  border: 1px solid #c7d7f1;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.pageScenarios .statusBar {
+  border: 1px solid #c9d9ef;
+  border-left: 4px solid #ff7b12;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.88);
+  color: #1f3f76;
+}
+
+.pageScenarios .workspace {
+  padding-top: 10px;
+}
+
+.pageScenarios .canvas {
+  border: 1px solid #c9d9ef;
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 10% 0%, rgba(255, 230, 198, 0.36), transparent 50%),
+    linear-gradient(160deg, rgba(255, 255, 255, 0.96), rgba(242, 248, 255, 0.94));
+  box-shadow:
+    0 20px 30px -28px rgba(15, 53, 115, 0.78),
+    0 2px 0 rgba(255, 255, 255, 0.8) inset;
+}
+
+.pageScenarios .sidePanel {
+  border: 1px solid #c9d9ef;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 18px 24px -24px rgba(15, 53, 115, 0.78),
+    0 1px 0 rgba(255, 255, 255, 0.85) inset;
+}
+
+.scenarioWorkspaceHero .libraryToolbar {
+  border: 1px solid #c7d7f1;
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 92% 10%, rgba(255, 130, 0, 0.16), transparent 34%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.97), rgba(241, 247, 255, 0.94));
+  box-shadow: 0 18px 30px -30px rgba(15, 53, 115, 0.9);
+}
+
+.scenarioWorkspaceHero .librarySummary {
+  border: 1px solid #c3d5f2;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #ffffff, #edf4ff);
+}
+
+.scenarioWorkspaceHero .folderCard,
+.scenarioWorkspaceHero .journeyCard {
+  border: 1px solid #c9d9ef;
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(255, 123, 0, 0.1), transparent 44%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(244, 249, 255, 0.94));
+  box-shadow: 0 18px 24px -26px rgba(15, 53, 115, 0.78);
 }
 
 .folderHead {
