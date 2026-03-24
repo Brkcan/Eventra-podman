@@ -40,6 +40,79 @@ npm run dev:frontend
 npm run dev:cache-loader
 ```
 
+## Podman ile Local Full Stack
+
+Bu repo, Podman ile tum servisleri container icinde local calistirmak icin `docker-compose.podman.yml` override dosyasi icerir.
+
+1. Podman VM'i baslat (macOS):
+
+```bash
+podman machine init
+podman machine start
+```
+
+`podman machine init` daha once yapildiysa tekrar gerekmez.
+
+2. Podman compose provider'ini kontrol et:
+
+```bash
+podman compose version
+```
+
+3. Local env dosyasini hazirla:
+
+```bash
+cp .env.example .env
+```
+
+4. Tum stack'i ayağa kaldir:
+
+```bash
+npm run podman:up
+```
+
+5. Durumu kontrol et:
+
+```bash
+npm run podman:ps
+podman compose -f docker-compose.yml -f docker-compose.podman.yml logs -f api
+```
+
+6. Saglik kontrolleri:
+
+```bash
+curl http://localhost:3001/health
+curl http://localhost:3002/health
+curl http://localhost:3010/health
+```
+
+Beklenen local adresler:
+- Frontend: `http://localhost:3000`
+- API: `http://localhost:3001`
+- Rule engine health: `http://localhost:3002/health`
+- Cache loader: `http://localhost:3010`
+
+Durdurma ve temizlik:
+
+```bash
+npm run podman:down
+```
+
+Volume/network dahil temizlemek istersen:
+
+```bash
+podman compose -f docker-compose.yml -f docker-compose.podman.yml down -v
+```
+
+Kisa komutlar:
+
+```bash
+npm run podman:up
+npm run podman:ps
+npm run podman:logs
+npm run podman:down
+```
+
 ## Ornek Event Gonderimi
 
 ```bash
@@ -230,3 +303,59 @@ Beklenen:
 - Prod'da sadece Caddy 80/443 portlarini aciyor.
 - Postgres/Redis/Kafka disariya acik degil.
 - API domain HTTPS oldugu icin frontend otomatik olarak HTTPS API'yi kullanir.
+
+## Podman ile Production Deploy (Unix Sunucu)
+
+Podman ile sunucuda deploy icin bu repo artik `docker-compose.podman.prod.yml` dosyasi icerir.
+
+1. Podman kurulumu ve servis kontrolu:
+
+```bash
+podman --version
+podman compose version
+```
+
+2. Projeyi sunucuya al:
+
+```bash
+git clone <repo-url> Eventra
+cd Eventra
+```
+
+3. Production env dosyasini hazirla:
+
+```bash
+cp .env.prod.example .env.prod
+nano .env.prod
+```
+
+Zorunlu alanlar:
+- `APP_DOMAIN`
+- `API_DOMAIN`
+- `ACME_EMAIL`
+- SMTP ayarlari
+
+4. DNS kayitlarini sunucu IP'sine yonlendir.
+
+5. Deploy et:
+
+```bash
+npm run podman:prod:up
+```
+
+6. Durumu kontrol et:
+
+```bash
+npm run podman:prod:ps
+npm run podman:prod:logs
+curl https://$API_DOMAIN/health
+```
+
+Kapatma:
+
+```bash
+npm run podman:prod:down
+```
+
+Sunucuda Podman rootless calisiyorsa `80/443` port bind islemi izin problemi yasatabilir.
+Bu durumda ya rootful Podman kullanilir ya da host uzerinde dusuk port izni acilir.

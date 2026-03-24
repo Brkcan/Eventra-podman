@@ -3,18 +3,10 @@
     acme_ca https://acme-v02.api.letsencrypt.org/directory
 }
 
-www.tekinspot.com {
+{$APP_DOMAIN} {
     reverse_proxy frontend:80
 }
 
-api.tekinspot.com {
+{$API_DOMAIN} {
     reverse_proxy api:3001
-}
-
-app.tekinspot.com {
-    reverse_proxy frontend:80
-}
-
-tekinspot.com {
-    redir https://www.tekinspot.com{uri} 308
 }
