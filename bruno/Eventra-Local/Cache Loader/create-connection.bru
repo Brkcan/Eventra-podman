@@ -17,11 +17,11 @@ headers {
 body:json {
 {
   "name": "Source DB",
-  "host": "host.docker.internal",
-  "port": 5432,
-  "database": "analytics",
-  "username": "analytics_user",
-  "password": "secret",
+  "host": "{{sourceDbHost}}",
+  "port": "{{sourceDbPort}}",
+  "database": "{{sourceDbName}}",
+  "username": "{{sourceDbUser}}",
+  "password": "{{sourceDbPassword}}",
   "ssl": false
 }
 }

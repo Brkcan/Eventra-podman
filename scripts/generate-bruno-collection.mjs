@@ -13,6 +13,9 @@ const envVars = {
   apiBaseUrl: 'http://localhost:3001',
   cacheLoaderBaseUrl: 'http://localhost:3010',
   customerId: 'cust-123',
+  customerEmail: 'customer@example.com',
+  customerFirstName: 'Burak',
+  customerTier: 3,
   journeyId: 'cart_abandonment_v1',
   journeyVersion: 1,
   fromVersion: 1,
@@ -24,7 +27,15 @@ const envVars = {
   endpointId: 'crm_webhook',
   instanceId: 'instance-123',
   connectionId: '11111111-1111-1111-1111-111111111111',
-  jobId: '22222222-2222-2222-2222-222222222222'
+  jobId: '22222222-2222-2222-2222-222222222222',
+  sourceDbHost: 'host.docker.internal',
+  sourceDbPort: 5432,
+  sourceDbName: 'analytics',
+  sourceDbUser: 'analytics_user',
+  sourceDbPassword: 'secret',
+  datasetKey: 'vip_customers',
+  webhookUrl: 'https://example.com/webhook',
+  folderPath: 'Workspace/Retention'
 };
 
 const requests = [
@@ -254,7 +265,7 @@ const requests = [
     body: {
       endpoint_id: '{{endpointId}}',
       method: 'POST',
-      url: 'https://example.com/webhook',
+      url: '{{webhookUrl}}',
       headers: {
         authorization: 'Bearer token'
       },
@@ -270,7 +281,7 @@ const requests = [
     url: '{{apiBaseUrl}}/catalogues/endpoints/{{endpointId}}',
     body: {
       method: 'POST',
-      url: 'https://example.com/webhook',
+      url: '{{webhookUrl}}',
       headers: {
         authorization: 'Bearer token'
       },
@@ -370,7 +381,7 @@ const requests = [
     method: 'post',
     url: '{{apiBaseUrl}}/journey-folders',
     body: {
-      folder_path: 'Workspace/Retention'
+      folder_path: '{{folderPath}}'
     }
   },
   {
@@ -398,7 +409,7 @@ const requests = [
     url: '{{apiBaseUrl}}/journeys/{{journeyId}}/move-folder',
     body: {
       version: '{{journeyVersion}}',
-      target_folder_path: 'Workspace/Retention'
+      target_folder_path: '{{folderPath}}'
     }
   },
   {
@@ -410,9 +421,9 @@ const requests = [
       customer_id: '{{customerId}}',
       segment: '{{segmentKey}}',
       attributes: {
-        first_name: 'Burak',
-        email: 'burak@example.com',
-        tier: 3
+        first_name: '{{customerFirstName}}',
+        email: '{{customerEmail}}',
+        tier: '{{customerTier}}'
       }
     }
   },
@@ -424,9 +435,9 @@ const requests = [
     body: {
       segment: '{{segmentKey}}',
       attributes: {
-        first_name: 'Burak',
-        email: 'burak@example.com',
-        tier: 3
+        first_name: '{{customerFirstName}}',
+        email: '{{customerEmail}}',
+        tier: '{{customerTier}}'
       }
     }
   },
@@ -516,11 +527,11 @@ const requests = [
     url: '{{cacheLoaderBaseUrl}}/connections',
     body: {
       name: 'Source DB',
-      host: 'host.docker.internal',
-      port: 5432,
-      database: 'analytics',
-      username: 'analytics_user',
-      password: 'secret',
+      host: '{{sourceDbHost}}',
+      port: '{{sourceDbPort}}',
+      database: '{{sourceDbName}}',
+      username: '{{sourceDbUser}}',
+      password: '{{sourceDbPassword}}',
       ssl: false
     }
   },
@@ -550,7 +561,7 @@ const requests = [
     body: {
       name: 'VIP Cache Refresh',
       connection_id: '{{connectionId}}',
-      dataset_key: 'vip_customers',
+      dataset_key: '{{datasetKey}}',
       sql_query: 'select id, email, tier from customers',
       key_column: 'id',
       run_time: '07:00',
@@ -578,7 +589,7 @@ const requests = [
     body: {
       name: 'VIP Cache Refresh',
       connection_id: '{{connectionId}}',
-      dataset_key: 'vip_customers',
+      dataset_key: '{{datasetKey}}',
       sql_query: 'select id, email, tier from customers',
       key_column: 'id',
       run_time: '08:00',
@@ -650,6 +661,34 @@ function renderEnv(vars) {
   return `${lines.join('\n')}\n`;
 }
 
+function renderReadme() {
+  return `# Eventra Bruno Collection
+
+Bu koleksiyon local Podman stack icin hazirlandi.
+
+Kullanim:
+- Bruno icine \`Eventra-Local.zip\` dosyasini import et
+- \`local\` environment sec
+- Gerekirse once \`environments/local.bru\` icindeki degiskenleri guncelle
+
+En onemli degiskenler:
+- \`apiBaseUrl\`
+- \`cacheLoaderBaseUrl\`
+- \`customerId\`
+- \`journeyId\`
+- \`connectionId\`
+- \`jobId\`
+
+Onerilen ilk akış:
+1. API/Core/Health
+2. API/Customers/Upsert Customer Profile
+3. API/Journeys/Create Or Update Journey
+4. API/Core/Ingest Event
+5. API/Operational/List Journey Instances
+6. Cache Loader/Health
+`;
+}
+
 async function ensureCleanDir(dir) {
   await fs.rm(dir, { recursive: true, force: true });
   await fs.mkdir(dir, { recursive: true });
@@ -675,6 +714,7 @@ async function writeCollection() {
   );
 
   await fs.writeFile(path.join(outputDir, 'environments', 'local.bru'), renderEnv(envVars), 'utf8');
+  await fs.writeFile(path.join(outputDir, 'README.md'), renderReadme(), 'utf8');
 
   for (const [index, request] of requests.entries()) {
     const folderPath = path.join(outputDir, ...request.folder.split('/'));
