@@ -26,10 +26,14 @@ const metadataDbUrl =
   'postgresql://eventra:eventra@localhost:5432/eventra';
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
-const metadataPg = new pg.Client({ connectionString: metadataDbUrl });
+let metadataPg = null;
 const redis = createClient({ url: redisUrl });
 
 const schedules = new Map();
+
+function createMetadataPgClient() {
+  return new pg.Client({ connectionString: metadataDbUrl });
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -622,7 +626,16 @@ app.get('/runs', async (req, res) => {
 app.use('/', express.static(publicDir));
 
 async function start() {
-  await withRetry('postgres connect', () => metadataPg.connect());
+  await withRetry('postgres connect', async () => {
+    const client = createMetadataPgClient();
+    try {
+      await client.connect();
+      metadataPg = client;
+    } catch (error) {
+      await client.end().catch(() => {});
+      throw error;
+    }
+  });
   await withRetry('redis connect', () => redis.connect());
   await ensureSchema();
   await refreshSchedules();

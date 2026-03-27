@@ -27,7 +27,7 @@ const consumer = kafka.consumer({ groupId: consumerGroupId });
 const producer = kafka.producer({
   createPartitioner: Partitioners.LegacyPartitioner
 });
-const pgClient = new pg.Client({ connectionString: postgresUrl });
+let pgClient = null;
 const redisClient = createClient({ url: redisUrl });
 const redisSubscriber = redisClient.duplicate();
 const mailTransporter =
@@ -39,6 +39,10 @@ const mailTransporter =
         auth: { user: smtpUser, pass: smtpPass }
       })
     : null;
+
+function createPgClient() {
+  return new pg.Client({ connectionString: postgresUrl });
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1842,7 +1846,16 @@ async function ensureKafkaTopics() {
 }
 
 async function run() {
-  await withRetry('postgres connect', () => pgClient.connect());
+  await withRetry('postgres connect', async () => {
+    const client = createPgClient();
+    try {
+      await client.connect();
+      pgClient = client;
+    } catch (error) {
+      await client.end().catch(() => {});
+      throw error;
+    }
+  });
   await withRetry('redis connect', () => redisClient.connect());
   await withRetry('redis subscriber connect', () => redisSubscriber.connect());
   await ensureSchema();
