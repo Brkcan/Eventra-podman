@@ -13,7 +13,32 @@ import {
 import 'reactflow/dist/style.css';
 import './styles.css';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+function resolveApiBaseUrl() {
+  const configured = String(import.meta.env.VITE_API_BASE_URL || '').trim();
+  if (typeof window === 'undefined') {
+    return configured || 'http://localhost:3001';
+  }
+
+  const { protocol, hostname } = window.location;
+  const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
+
+  if (configured) {
+    if (configured.includes('localhost') && !isLocalHost) {
+      const derivedHost = hostname.startsWith('www.') ? `api.${hostname.slice(4)}` : `api.${hostname}`;
+      return `https://${derivedHost}`;
+    }
+    return configured;
+  }
+
+  if (isLocalHost) {
+    return 'http://localhost:3001';
+  }
+
+  const derivedHost = hostname.startsWith('www.') ? `api.${hostname.slice(4)}` : `api.${hostname}`;
+  return `${protocol}//${derivedHost}`;
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 const DEFAULT_FOLDER = 'Workspace';
 const NAV_ITEMS = ['Scenarios', 'Catalogues', 'Management', 'Dashboards'];
 const DASHBOARD_TABS = [
