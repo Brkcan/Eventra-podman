@@ -31,6 +31,27 @@ const redis = createClient({ url: redisUrl });
 
 const schedules = new Map();
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry(label, fn, attempts = 20, delayMs = 3000) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const message = error?.message || String(error);
+      console.warn(`[cache-loader] ${label} failed (${attempt}/${attempts}): ${message}`);
+      if (attempt < attempts) {
+        await sleep(delayMs);
+      }
+    }
+  }
+  throw lastError;
+}
+
 const ConnectionSchema = z.object({
   name: z.string().min(1),
   host: z.string().min(1),
@@ -601,8 +622,8 @@ app.get('/runs', async (req, res) => {
 app.use('/', express.static(publicDir));
 
 async function start() {
-  await metadataPg.connect();
-  await redis.connect();
+  await withRetry('postgres connect', () => metadataPg.connect());
+  await withRetry('redis connect', () => redis.connect());
   await ensureSchema();
   await refreshSchedules();
 

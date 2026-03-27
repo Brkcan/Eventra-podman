@@ -40,6 +40,27 @@ const mailTransporter =
       })
     : null;
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry(label, fn, attempts = 20, delayMs = 3000) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const message = error?.message || String(error);
+      console.warn(`[bootstrap] ${label} failed (${attempt}/${attempts}): ${message}`);
+      if (attempt < attempts) {
+        await sleep(delayMs);
+      }
+    }
+  }
+  throw lastError;
+}
+
 let runtimeJourneys = [];
 let runtimeGlobalPause = false;
 const inMemoryCacheDatasets = new Map();
@@ -1821,11 +1842,11 @@ async function ensureKafkaTopics() {
 }
 
 async function run() {
-  await pgClient.connect();
-  await redisClient.connect();
-  await redisSubscriber.connect();
+  await withRetry('postgres connect', () => pgClient.connect());
+  await withRetry('redis connect', () => redisClient.connect());
+  await withRetry('redis subscriber connect', () => redisSubscriber.connect());
   await ensureSchema();
-  await ensureKafkaTopics();
+  await withRetry('kafka topic ensure', () => ensureKafkaTopics());
   await refreshRuntimeJourneys();
   startHealthServer();
 
@@ -1842,9 +1863,9 @@ async function run() {
     }
   });
 
-  await producer.connect();
-  await consumer.connect();
-  await consumer.subscribe({ topic: 'event.raw', fromBeginning: false });
+  await withRetry('kafka producer connect', () => producer.connect());
+  await withRetry('kafka consumer connect', () => consumer.connect());
+  await withRetry('kafka subscribe', () => consumer.subscribe({ topic: 'event.raw', fromBeginning: false }));
 
   setInterval(() => {
     evaluateDueJourneys().catch((error) => {

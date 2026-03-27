@@ -132,6 +132,27 @@ const producer = kafka.producer({
 const pgClient = new pg.Client({ connectionString: postgresUrl });
 const redis = createClient({ url: redisUrl });
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry(label, fn, attempts = 20, delayMs = 3000) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const message = error?.message || String(error);
+      console.warn(`[bootstrap] ${label} failed (${attempt}/${attempts}): ${message}`);
+      if (attempt < attempts) {
+        await sleep(delayMs);
+      }
+    }
+  }
+  throw lastError;
+}
+
 function parseLimit(value, defaultValue = 100, maxValue = 500) {
   const n = Number(value ?? defaultValue);
   if (!Number.isFinite(n) || n <= 0) return defaultValue;
@@ -587,8 +608,10 @@ async function ensureSchema() {
 }
 
 async function bootstrap() {
-  await Promise.all([producer.connect(), pgClient.connect(), redis.connect()]);
-  await ensureKafkaTopics();
+  await withRetry('postgres connect', () => pgClient.connect());
+  await withRetry('redis connect', () => redis.connect());
+  await withRetry('kafka producer connect', () => producer.connect());
+  await withRetry('kafka topic ensure', () => ensureKafkaTopics());
 
   await ensureSchema();
 }
