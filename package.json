@@ -14,13 +14,6 @@
     "start:rule-engine": "npm --workspace @eventra/rule-engine run start",
     "dev:cache-loader": "npm --workspace @eventra/cache-loader run dev",
     "start:cache-loader": "npm --workspace @eventra/cache-loader run start",
-    "podman:up": "podman compose -f docker-compose.yml -f docker-compose.podman.yml up -d --build",
-    "podman:down": "podman compose -f docker-compose.yml -f docker-compose.podman.yml down",
-    "podman:logs": "podman compose -f docker-compose.yml -f docker-compose.podman.yml logs -f",
-    "podman:ps": "podman compose -f docker-compose.yml -f docker-compose.podman.yml ps",
-    "podman:prod:up": "podman compose -f docker-compose.podman.prod.yml up -d --build",
-    "podman:prod:down": "podman compose -f docker-compose.podman.prod.yml down",
-    "podman:prod:logs": "podman compose -f docker-compose.podman.prod.yml logs -f",
-    "podman:prod:ps": "podman compose -f docker-compose.podman.prod.yml ps"
+    "build:frontend": "npm --workspace @eventra/frontend run build"
   }
 }

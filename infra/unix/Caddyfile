@@ -1,0 +1,14 @@
+www.example.com {
+    root * /opt/eventra/current/apps/frontend/dist
+    encode zstd gzip
+    file_server
+
+    @index path /
+    header @index Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate"
+
+    try_files {path} /index.html
+}
+
+api.example.com {
+    reverse_proxy 127.0.0.1:3001
+}

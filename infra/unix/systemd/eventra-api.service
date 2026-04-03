@@ -1,0 +1,19 @@
+[Unit]
+Description=Eventra API
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/eventra/current
+EnvironmentFile=/etc/eventra/eventra.env
+ExecStart=/usr/bin/npm --workspace @eventra/api run start
+Restart=always
+RestartSec=5
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -11,24 +11,34 @@ Bu repo, EVAM benzeri bir urun icin ilk MVP iskeletini kurar.
 - Postgres kalici veri
 - React Flow journey designer (`apps/frontend`)
 
-## Baslatma
+## Local Baslatma
 
-1. Altyapi:
+Bu repo artik Docker/Podman merkezli degil. Gelistirme ve deploy akisi, ayri servisler ve host servisleri uzerinden ilerler.
 
-```bash
-docker compose up -d
-```
+Gerekli host servisleri:
 
-2. Paketleri yukle:
+- PostgreSQL
+- Redis
+- Kafka
+
+1. Paketleri yukle:
 
 ```bash
 npm install
 ```
 
-3. Ortam degiskenleri:
+2. Ortam degiskenlerini hazirla:
 
 ```bash
 cp .env.example .env
+```
+
+3. Host servis adreslerini `.env` icinde duzenle:
+
+```bash
+KAFKA_BROKERS=127.0.0.1:9092
+POSTGRES_URL=postgresql://eventra:eventra@127.0.0.1:5432/eventra
+REDIS_URL=redis://127.0.0.1:6379
 ```
 
 4. Servisleri ayri terminallerde calistir:
@@ -36,54 +46,8 @@ cp .env.example .env
 ```bash
 npm run dev:api
 npm run dev:rule-engine
-npm run dev:frontend
 npm run dev:cache-loader
-```
-
-## Podman ile Local Full Stack
-
-Bu repo, Podman ile tum servisleri container icinde local calistirmak icin `docker-compose.podman.yml` override dosyasi icerir.
-
-1. Podman VM'i baslat (macOS):
-
-```bash
-podman machine init
-podman machine start
-```
-
-`podman machine init` daha once yapildiysa tekrar gerekmez.
-
-2. Podman compose provider'ini kontrol et:
-
-```bash
-podman compose version
-```
-
-3. Local env dosyasini hazirla:
-
-```bash
-cp .env.example .env
-```
-
-4. Tum stack'i ayağa kaldir:
-
-```bash
-npm run podman:up
-```
-
-5. Durumu kontrol et:
-
-```bash
-npm run podman:ps
-podman compose -f docker-compose.yml -f docker-compose.podman.yml logs -f api
-```
-
-6. Saglik kontrolleri:
-
-```bash
-curl http://localhost:3001/health
-curl http://localhost:3002/health
-curl http://localhost:3010/health
+npm run dev:frontend
 ```
 
 Beklenen local adresler:
@@ -92,26 +56,41 @@ Beklenen local adresler:
 - Rule engine health: `http://localhost:3002/health`
 - Cache loader: `http://localhost:3010`
 
-Durdurma ve temizlik:
+Saglik kontrolleri:
 
 ```bash
-npm run podman:down
+curl http://localhost:3001/health
+curl http://localhost:3002/health
+curl http://localhost:3010/health
 ```
 
-Volume/network dahil temizlemek istersen:
+## Unix Deployment (Container'siz)
+
+Docker/Podman kullanmadan klasik Unix sunucuda ayri servisler olarak calistirmak icin hazir iskelet:
+
+- dokuman: [infra/unix/README.md](infra/unix/README.md)
+- `systemd` unitleri:
+  - [infra/unix/systemd/eventra-api.service](infra/unix/systemd/eventra-api.service)
+  - [infra/unix/systemd/eventra-rule-engine.service](infra/unix/systemd/eventra-rule-engine.service)
+  - [infra/unix/systemd/eventra-cache-loader.service](infra/unix/systemd/eventra-cache-loader.service)
+- Caddy config:
+  - [infra/unix/Caddyfile](infra/unix/Caddyfile)
+
+Bu modelde:
+
+- `api`, `rule-engine`, `cache-loader` ayri `systemd` servisleri olarak calisir
+- `frontend` static build olarak `caddy` ile servis edilir
+- `postgres`, `redis`, `kafka` host servisleri olur
+
+Bu sayede su komutlar dogrudan mumkun olur:
 
 ```bash
-podman compose -f docker-compose.yml -f docker-compose.podman.yml down -v
+systemctl start eventra-api
+systemctl stop eventra-api
+systemctl restart eventra-rule-engine
+systemctl status eventra-cache-loader --no-pager
 ```
 
-Kisa komutlar:
-
-```bash
-npm run podman:up
-npm run podman:ps
-npm run podman:logs
-npm run podman:down
-```
 
 ## Ornek Event Gonderimi
 
@@ -234,194 +213,14 @@ curl -X PUT http://localhost:3001/customers/cust-123/profile \
 - Journey action node `channel=email` oldugunda worker SMTP ile gondermeyi dener.
 - Sonuc `action_log.status` alanina `sent` veya `failed` olarak yazar.
 
-## Production Deployment (Internet Acik)
+## Production Deployment
 
-Bu adimlar sunucuda (Ubuntu 22.04/24.04) uygulanir.
+Production hedef modeli:
 
-1. Sunucuya baglan:
+- host uzerinde PostgreSQL / Redis / Kafka
+- `systemd` ile `api`, `rule-engine`, `cache-loader`
+- `caddy` ile static frontend + API reverse proxy
 
-```bash
-ssh root@SUNUCU_IP
-```
+Detayli kurulum:
 
-2. Docker kur:
-
-```bash
-curl -fsSL https://get.docker.com | sh
-apt-get update && apt-get install -y docker-compose-plugin
-```
-
-3. Projeyi kopyala:
-
-```bash
-git clone <repo-url> Eventra
-cd Eventra
-```
-
-4. Production env hazirla:
-
-```bash
-cp .env.prod.example .env.prod
-nano .env.prod
-```
-
-Guncellenecek zorunlu alanlar:
-- `APP_DOMAIN` (or: `app.senin-domain.com`)
-- `API_DOMAIN` (or: `api.senin-domain.com`)
-- `ACME_EMAIL`
-- SMTP ayarlari
-
-5. DNS ayari yap:
-- `A` kaydi: `APP_DOMAIN` -> sunucu IP
-- `A` kaydi: `API_DOMAIN` -> sunucu IP
-
-6. Uygulamayi ayağa kaldir:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-```
-
-7. Kontrol et:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
-docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f caddy
-```
-
-8. Saglik testi:
-
-```bash
-curl https://$API_DOMAIN/health
-```
-
-Beklenen:
-- Frontend: `https://$APP_DOMAIN`
-- API: `https://$API_DOMAIN`
-
-### Notlar
-
-- Prod'da sadece Caddy 80/443 portlarini aciyor.
-- Postgres/Redis/Kafka disariya acik degil.
-- API domain HTTPS oldugu icin frontend otomatik olarak HTTPS API'yi kullanir.
-
-## Podman ile Production Deploy (Unix Sunucu)
-
-Podman ile sunucuda deploy icin bu repo artik `docker-compose.podman.prod.yml` dosyasi icerir.
-
-1. Podman kurulumu ve servis kontrolu:
-
-```bash
-podman --version
-podman compose version
-```
-
-2. Projeyi sunucuya al:
-
-```bash
-git clone <repo-url> Eventra
-cd Eventra
-```
-
-3. Production env dosyasini hazirla:
-
-```bash
-cp .env.prod.example .env.prod
-nano .env.prod
-```
-
-Zorunlu alanlar:
-- `APP_DOMAIN`
-- `API_DOMAIN`
-- `ACME_EMAIL`
-- SMTP ayarlari
-
-4. DNS kayitlarini sunucu IP'sine yonlendir.
-
-5. Deploy et:
-
-```bash
-npm run podman:prod:up
-```
-
-6. Durumu kontrol et:
-
-```bash
-npm run podman:prod:ps
-npm run podman:prod:logs
-curl https://$API_DOMAIN/health
-```
-
-Kapatma:
-
-```bash
-npm run podman:prod:down
-```
-
-Sunucuda Podman rootless calisiyorsa `80/443` port bind islemi izin problemi yasatabilir.
-Bu durumda ya rootful Podman kullanilir ya da host uzerinde dusuk port izni acilir.
-
-## VPS icin Daha Stabil Secenek: Caddy Hostta, Uygulama Podman'da
-
-Eger VPS uzerinde Podman container icindeki Caddy, ACME/Let's Encrypt DNS timeout yasiyorsa
-`docker-compose.podman.prod.host-proxy.yml` dosyasini kullan.
-
-Bu senaryoda:
-- API hostta `127.0.0.1:3001`
-- Frontend hostta `127.0.0.1:3000`
-- Cache loader hostta `127.0.0.1:3010`
-- Caddy container icinde degil, dogrudan VPS uzerinde calisir
-
-Podman stack:
-
-```bash
-podman-compose -f docker-compose.podman.prod.host-proxy.yml up -d --build
-```
-
-Host Caddyfile ornegi:
-
-```caddy
-www.tekinspot.com {
-    reverse_proxy 127.0.0.1:3000
-}
-
-api.tekinspot.com {
-    reverse_proxy 127.0.0.1:3001
-}
-```
-
-Bu model, VPS DNS cozumlemesini host isletim sistemi uzerinden yaptigi icin
-container icindeki ACME DNS problemlerini by-pass eder.
-
-## VPS icin En Guvenli Podman Secenegi: Host Loopback Baglantilari
-
-Eger Podman service discovery (`postgres`, `redis`, `kafka`) VPS uzerinde
-`EAI_AGAIN` benzeri DNS hatalari uretiyorsa `docker-compose.podman.prod.vps.yml`
-dosyasini kullan.
-
-Bu modelde:
-- Postgres hostta `127.0.0.1:5432`
-- Redis hostta `127.0.0.1:6379`
-- Kafka hostta `127.0.0.1:9092`
-- API host network ile `127.0.0.1:3001`
-- Rule engine host network ile `127.0.0.1:3002`
-- Cache loader host network ile `127.0.0.1:3010`
-- Frontend `127.0.0.1:3000`
-- Host Caddy bu loopback portlara reverse proxy yapar
-
-Deploy:
-
-```bash
-podman-compose -f docker-compose.podman.prod.vps.yml up -d --build
-```
-
-Host Caddyfile:
-
-```caddy
-www.tekinspot.com {
-    reverse_proxy 127.0.0.1:3000
-}
-
-api.tekinspot.com {
-    reverse_proxy 127.0.0.1:3001
-}
-```
+- [infra/unix/README.md](infra/unix/README.md)
