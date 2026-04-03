@@ -3,15 +3,16 @@ import http from 'node:http';
 import dotenv from 'dotenv';
 import { Kafka, Partitioners } from 'kafkajs';
 import nodemailer from 'nodemailer';
-import pg from 'pg';
 import { createClient } from 'redis';
+import { describeDatabaseTarget, resolvePrimaryDatabaseConfig } from '../../../lib/database-config.mjs';
+import { createDatabaseClient } from '../../../lib/database-runtime.mjs';
 
 dotenv.config({ path: '../../.env' });
 
 const kafkaBrokers = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
-const postgresUrl = process.env.POSTGRES_URL || 'postgresql://eventra:eventra@localhost:5432/eventra';
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 const healthPort = Number(process.env.RULE_ENGINE_HEALTH_PORT || 3002);
+const primaryDb = resolvePrimaryDatabaseConfig();
 const smtpHost = process.env.SMTP_HOST || '';
 const smtpPort = Number(process.env.SMTP_PORT || 587);
 const smtpSecure = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
@@ -19,6 +20,12 @@ const smtpUser = process.env.SMTP_USER || '';
 const smtpPass = process.env.SMTP_PASS || '';
 const smtpFrom = process.env.SMTP_FROM || 'Eventra <no-reply@eventra.local>';
 const emailDryRun = String(process.env.EMAIL_DRY_RUN || 'true').toLowerCase() === 'true';
+
+console.info(
+  `[bootstrap] rule-engine primary database vendor=${primaryDb.vendor} target=${describeDatabaseTarget(
+    primaryDb
+  )}`
+);
 
 const kafka = new Kafka({ clientId: 'eventra-rule-engine', brokers: kafkaBrokers });
 const admin = kafka.admin();
@@ -41,7 +48,7 @@ const mailTransporter =
     : null;
 
 function createPgClient() {
-  return new pg.Client({ connectionString: postgresUrl });
+  return createDatabaseClient(primaryDb);
 }
 
 function sleep(ms) {
@@ -69,6 +76,41 @@ let runtimeJourneys = [];
 let runtimeGlobalPause = false;
 const inMemoryCacheDatasets = new Map();
 const inMemoryCacheMeta = new Map();
+const isOracle = primaryDb.vendor === 'oracle';
+
+function oneRowClause() {
+  return 'fetch first 1 rows only';
+}
+
+function normalizeJsonField(value, fallback) {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return fallback;
+    }
+  }
+  return value;
+}
+
+function mergeJson(baseValue, patchValue) {
+  return {
+    ...normalizeJsonField(baseValue, {}),
+    ...normalizeJsonField(patchValue, {})
+  };
+}
+
+function addMinutes(dateLike, minutes) {
+  const base = new Date(dateLike);
+  if (Number.isNaN(base.getTime())) {
+    return null;
+  }
+  base.setMinutes(base.getMinutes() + Number(minutes || 0));
+  return base;
+}
 
 async function loadDatasetIntoMemory(datasetKey) {
   const key = String(datasetKey || '').trim();
@@ -203,13 +245,15 @@ async function markEventConsumed(eventId) {
   }
 
   const result = await pgClient.query(
-    `insert into consumed_events (consumer_group, event_id)
-     values ($1, $2)
-     on conflict (consumer_group, event_id) do nothing
-     returning event_id`,
+    `merge into consumed_events ce
+     using (select $1 consumer_group, $2 event_id from dual) src
+     on (ce.consumer_group = src.consumer_group and ce.event_id = src.event_id)
+     when not matched then
+       insert (consumer_group, event_id, consumed_at)
+       values (src.consumer_group, src.event_id, current_timestamp)`,
     [consumerGroupId, eventId]
   );
-  return result.rowCount > 0;
+  return result.rowsAffected > 0;
 }
 
 async function pushToDlq({ rawPayload, errorMessage, parsedEvent }) {
@@ -581,15 +625,17 @@ async function isRateLimited(route, journey, customerId) {
     return false;
   }
 
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
   const result = await pgClient.query(
-    `select count(*)::int as cnt
+    `select count(*) as cnt
      from edge_transition_log
      where journey_id = $1
        and journey_version = $2
        and edge_id = $3
        and customer_id = $4
-       and triggered_at >= date_trunc('day', now())`,
-    [journey.journey_id, journey.version, route.edge_id, customerId]
+       and triggered_at >= $5`,
+    [journey.journey_id, journey.version, route.edge_id, customerId, startOfDay]
   );
 
   return (result.rows[0]?.cnt || 0) >= limit;
@@ -606,19 +652,42 @@ async function reserveEdgeCapacity(route, journey) {
     if (!Number.isFinite(limit) || limit <= 0) {
       return true;
     }
-    const result = await pgClient.query(
-      `insert into edge_capacity_usage
-        (journey_id, journey_version, edge_id, window_type, window_start, used_count, updated_at)
-       values ($1, $2, $3, $4, $5, 1, now())
-       on conflict (journey_id, journey_version, edge_id, window_type, window_start)
-       do update set
-         used_count = edge_capacity_usage.used_count + 1,
-         updated_at = now()
-       where edge_capacity_usage.used_count < $6
-       returning used_count`,
-      [journey.journey_id, journey.version, route.edge_id, windowType, windowStart, limit]
+    const existing = await pgClient.query(
+      `select used_count
+       from edge_capacity_usage
+       where journey_id = $1
+         and journey_version = $2
+         and edge_id = $3
+         and window_type = $4
+         and window_start = $5
+       ${oneRowClause()}`,
+      [journey.journey_id, journey.version, route.edge_id, windowType, windowStart]
     );
-    return result.rowCount > 0;
+    if (existing.rowCount === 0) {
+      await pgClient.query(
+        `insert into edge_capacity_usage
+          (journey_id, journey_version, edge_id, window_type, window_start, used_count, updated_at)
+         values ($1, $2, $3, $4, $5, 1, current_timestamp)`,
+        [journey.journey_id, journey.version, route.edge_id, windowType, windowStart]
+      );
+      return true;
+    }
+    const usedCount = Number(existing.rows[0]?.used_count || 0);
+    if (usedCount >= limit) {
+      return false;
+    }
+    await pgClient.query(
+      `update edge_capacity_usage
+       set used_count = used_count + 1,
+           updated_at = current_timestamp
+       where journey_id = $1
+         and journey_version = $2
+         and edge_id = $3
+         and window_type = $4
+         and window_start = $5`,
+      [journey.journey_id, journey.version, route.edge_id, windowType, windowStart]
+    );
+    return true;
   };
 
   if (Number.isFinite(totalLimit) && totalLimit > 0) {
@@ -665,8 +734,9 @@ function findFirstActionNodeId(startNodeId, nodeMap, outgoingEdges) {
 }
 
 function normalizeJourneyDefinition(row) {
-  const nodes = Array.isArray(row.graph_json?.nodes) ? row.graph_json.nodes : [];
-  const edges = Array.isArray(row.graph_json?.edges) ? row.graph_json.edges : [];
+  const graph = normalizeJsonField(row.graph_json, {});
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph?.edges) ? graph.edges : [];
 
   const nodeMap = new Map(nodes.map((node) => [node.id, node]));
   const outgoingEdges = new Map();
@@ -918,27 +988,26 @@ async function refreshRuntimeJourneys() {
               row_number() over (partition by j.journey_id order by j.version desc) as rn
        from journeys j
        where j.status = 'published'
-     ),
-     gp as (
-       select coalesce((value_json->>'enabled')::boolean, false) as enabled
-       from runtime_controls
-       where key = 'global_pause'
-       limit 1
      )
      select
        r.journey_id,
        r.version,
        r.graph_json,
-       coalesce(rc.rollout_percent, 100)::int as rollout_percent,
-       coalesce(rc.release_paused, false) as release_paused,
-       coalesce((select enabled from gp), false) as global_pause
+       coalesce(rc.rollout_percent, 100) as rollout_percent,
+       coalesce(rc.release_paused, 0) as release_paused
      from ranked r
      left join journey_release_controls rc
        on rc.journey_id = r.journey_id and rc.journey_version = r.version
      where r.rn = 1`
   );
-
-  runtimeGlobalPause = Boolean(result.rows[0]?.global_pause);
+  const globalPauseResult = await pgClient.query(
+    `select value_json
+     from runtime_controls
+     where key = 'global_pause'
+     ${oneRowClause()}`
+  );
+  const globalPauseJson = normalizeJsonField(globalPauseResult.rows[0]?.value_json, {});
+  runtimeGlobalPause = Boolean(globalPauseJson?.enabled);
 
   runtimeJourneys = result.rows
     .map((row) => normalizeJourneyDefinition(row))
@@ -948,258 +1017,7 @@ async function refreshRuntimeJourneys() {
 }
 
 async function ensureSchema() {
-  await pgClient.query(`
-    create table if not exists events (
-      event_id text primary key,
-      customer_id text not null,
-      event_type text not null,
-      ts timestamptz not null,
-      payload jsonb not null,
-      source text not null
-    )
-  `);
-  await pgClient.query(`
-    create index if not exists idx_events_customer_type_ts
-      on events (customer_id, event_type, ts desc)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_events_customer_ts
-      on events (customer_id, ts desc)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_events_ts_brin
-      on events using brin (ts)
-  `);
-
-  await pgClient.query(`
-    create table if not exists customer_profiles (
-      customer_id text primary key,
-      segment text,
-      attributes jsonb not null default '{}'::jsonb,
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists action_log (
-      action_id text primary key,
-      event_id text not null,
-      customer_id text not null,
-      journey_id text,
-      journey_version int,
-      journey_node_id text,
-      channel text not null,
-      status text not null,
-      message text not null,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`alter table action_log add column if not exists journey_id text`);
-  await pgClient.query(`alter table action_log add column if not exists journey_version int`);
-  await pgClient.query(`alter table action_log add column if not exists journey_node_id text`);
-
-  await pgClient.query(`
-    create table if not exists edge_transition_log (
-      id text primary key,
-      journey_id text not null,
-      journey_version int not null,
-      edge_id text not null,
-      customer_id text not null,
-      triggered_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_edge_transition_daily
-      on edge_transition_log (journey_id, journey_version, edge_id, customer_id, triggered_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists external_call_log (
-      id text primary key,
-      instance_id text not null,
-      journey_id text not null,
-      journey_version int not null,
-      customer_id text not null,
-      journey_node_id text not null,
-      method text not null,
-      url text not null,
-      status_code int not null default 0,
-      result_type text not null,
-      reason text not null,
-      response_json jsonb,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_external_call_log_lookup
-      on external_call_log (journey_id, journey_version, customer_id, created_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists journeys (
-      journey_id text not null,
-      version int not null,
-      name text not null,
-      status text not null default 'published',
-      folder_path text not null default 'Workspace',
-      graph_json jsonb not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, version)
-    )
-  `);
-  await pgClient.query(
-    `alter table journeys add column if not exists folder_path text not null default 'Workspace'`
-  );
-
-  await pgClient.query(`
-    create table if not exists journey_instances (
-      instance_id text primary key,
-      journey_id text not null,
-      journey_version int not null,
-      customer_id text not null,
-      state text not null,
-      current_node text not null,
-      started_at timestamptz not null,
-      due_at timestamptz,
-      completed_at timestamptz,
-      last_event_id text,
-      context_json jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    drop index if exists uq_journey_instance_active
-  `);
-
-  await pgClient.query(`
-    create unique index uq_journey_instance_active
-      on journey_instances (journey_id, customer_id)
-      where state in ('waiting', 'waiting_manual', 'active', 'processing')
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_due
-      on journey_instances (state, due_at)
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_journey_state_due
-      on journey_instances (journey_id, state, due_at)
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_customer_updated
-      on journey_instances (customer_id, updated_at desc)
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_updated
-      on journey_instances (updated_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists event_dlq (
-      id text primary key,
-      event_id text,
-      customer_id text,
-      event_type text,
-      source_topic text not null,
-      error_message text not null,
-      raw_payload jsonb,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_event_dlq_created
-      on event_dlq (created_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists journey_instance_transitions (
-      id text primary key,
-      instance_id text not null,
-      journey_id text not null,
-      journey_version int not null,
-      customer_id text not null,
-      from_state text,
-      to_state text not null,
-      from_node text,
-      to_node text,
-      reason text,
-      event_id text,
-      metadata_json jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_instance_transitions_lookup
-      on journey_instance_transitions (instance_id, created_at desc)
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_instance_transitions_customer
-      on journey_instance_transitions (customer_id, created_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists consumed_events (
-      consumer_group text not null,
-      event_id text not null,
-      consumed_at timestamptz not null default now(),
-      primary key (consumer_group, event_id)
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists journey_release_controls (
-      journey_id text not null,
-      journey_version int not null,
-      rollout_percent int not null default 100,
-      release_paused boolean not null default false,
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, journey_version)
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists runtime_controls (
-      key text primary key,
-      value_json jsonb not null default '{}'::jsonb,
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(
-    `insert into runtime_controls (key, value_json)
-     values ('global_pause', '{"enabled": false}'::jsonb)
-     on conflict (key) do nothing`
-  );
-
-  await pgClient.query(`
-    create table if not exists edge_capacity_usage (
-      journey_id text not null,
-      journey_version int not null,
-      edge_id text not null,
-      window_type text not null,
-      window_start timestamptz not null,
-      used_count int not null default 0,
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, journey_version, edge_id, window_type, window_start)
-    )
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_edge_capacity_lookup
-      on edge_capacity_usage (journey_id, journey_version, edge_id, window_type, window_start desc)
-  `);
+  return;
 }
 
 async function createOrReplaceWaitingInstance(journey, event) {
@@ -1207,21 +1025,26 @@ async function createOrReplaceWaitingInstance(journey, event) {
     `select instance_id, state, current_node, journey_version
      from journey_instances
      where journey_id = $1 and customer_id = $2 and state in ('waiting', 'waiting_manual', 'active', 'processing')
-     limit 1`,
+     ${oneRowClause()}`,
     [journey.journey_id, event.customer_id]
   );
 
   if (existing.rowCount > 0) {
     const current = existing.rows[0];
+    const nextState = journey.wait_is_manual ? 'waiting_manual' : 'waiting';
+    const nextContext = JSON.stringify({
+      trigger_event_id: event.event_id,
+      trigger_ts: event.ts
+    });
     await pgClient.query(
       `update journey_instances
        set state = $7,
            current_node = $6,
            started_at = $1,
-           due_at = case when $7 = 'waiting_manual' then null else $2::timestamptz + make_interval(mins => $3) end,
+           due_at = $8,
            last_event_id = $4,
-           context_json = jsonb_build_object('trigger_event_id', $4, 'trigger_ts', $1),
-           updated_at = now(),
+           context_json = $9,
+           updated_at = current_timestamp,
            completed_at = null
        where instance_id = $5`,
       [
@@ -1231,7 +1054,9 @@ async function createOrReplaceWaitingInstance(journey, event) {
         event.event_id,
         current.instance_id,
         journey.wait_node_id,
-        journey.wait_is_manual ? 'waiting_manual' : 'waiting'
+        nextState,
+        nextState === 'waiting_manual' ? null : addMinutes(event.ts, journey.wait_minutes),
+        nextContext
       ]
     );
     await logInstanceTransition({
@@ -1251,27 +1076,29 @@ async function createOrReplaceWaitingInstance(journey, event) {
   }
 
   const newInstanceId = crypto.randomUUID();
+  const initialState = journey.wait_is_manual ? 'waiting_manual' : 'waiting';
+  const initialContext = JSON.stringify({
+    trigger_event_id: event.event_id,
+    trigger_ts: event.ts,
+    wait_node_id: journey.wait_node_id,
+    action_node_id: journey.default_action_node_id
+  });
   await pgClient.query(
     `insert into journey_instances
-      (instance_id, journey_id, journey_version, customer_id, state, current_node, started_at, due_at, last_event_id, context_json)
+      (instance_id, journey_id, journey_version, customer_id, state, current_node, started_at, due_at, last_event_id, context_json, created_at, updated_at)
      values
-      ($1, $2, $3, $4, $10, $5, $6, case when $10 = 'waiting_manual' then null else $6::timestamptz + make_interval(mins => $7) end, $8, $9)`,
+      ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, current_timestamp, current_timestamp)`,
     [
       newInstanceId,
       journey.journey_id,
       journey.version,
       event.customer_id,
+      initialState,
       journey.wait_node_id,
       event.ts,
-      journey.wait_minutes,
+      initialState === 'waiting_manual' ? null : addMinutes(event.ts, journey.wait_minutes),
       event.event_id,
-      JSON.stringify({
-        trigger_event_id: event.event_id,
-        trigger_ts: event.ts,
-        wait_node_id: journey.wait_node_id,
-        action_node_id: journey.default_action_node_id
-      }),
-      journey.wait_is_manual ? 'waiting_manual' : 'waiting'
+      initialContext
     ]
   );
 
@@ -1308,25 +1135,34 @@ async function processEvent(event) {
 }
 
 async function evaluateDueJourney(journey) {
-  const claimed = await pgClient.query(
-    `with due as (
-       select instance_id
+  const claimed = await (async () => {
+    const due = await pgClient.query(
+      `select instance_id, customer_id, started_at, last_event_id, context_json, current_node, journey_version
        from journey_instances
        where journey_id = $1
          and state = 'waiting'
-         and due_at <= now()
+         and due_at <= current_timestamp
        order by due_at asc
-       limit 50
-       for update skip locked
-     )
-     update journey_instances ji
-     set state = 'processing', updated_at = now()
-     from due
-     where ji.instance_id = due.instance_id
-     returning ji.instance_id, ji.customer_id, ji.started_at, ji.last_event_id, ji.context_json,
-               ji.state as to_state, 'waiting'::text as from_state, ji.current_node, ji.journey_version`,
-    [journey.journey_id]
-  );
+       fetch first 50 rows only`,
+      [journey.journey_id]
+    );
+    for (const item of due.rows) {
+      await pgClient.query(
+        `update journey_instances
+         set state = 'processing', updated_at = current_timestamp
+         where instance_id = $1`,
+        [item.instance_id]
+      );
+    }
+    return {
+      rows: due.rows.map((item) => ({
+        ...item,
+        to_state: 'processing',
+        from_state: 'waiting'
+      })),
+      rowCount: due.rows.length
+    };
+  })();
 
   for (const instance of claimed.rows) {
     try {
@@ -1349,11 +1185,11 @@ async function evaluateDueJourney(journey) {
         journey.condition_event_type &&
         (journey.condition_key === 'purchase_exists' || journey.condition_key === 'event_exists')
       ) {
-        const eventCheck = await pgClient.query(
+      const eventCheck = await pgClient.query(
           `select 1
            from events
            where customer_id = $1 and event_type = $2 and ts >= $3
-           limit 1`,
+           ${oneRowClause()}`,
           [instance.customer_id, journey.condition_event_type, instance.started_at]
         );
         conditionMatched = eventCheck.rowCount > 0;
@@ -1367,7 +1203,7 @@ async function evaluateDueJourney(journey) {
           `select 1
            from customer_profiles
            where customer_id = $1 and segment = $2
-           limit 1`,
+           ${oneRowClause()}`,
           [instance.customer_id, journey.condition_segment_value]
         );
         conditionMatched = segmentCheck.rowCount > 0;
@@ -1377,20 +1213,20 @@ async function evaluateDueJourney(journey) {
         `select payload
          from events
          where event_id = $1
-         limit 1`,
+         ${oneRowClause()}`,
         [instance.last_event_id]
       );
       const profileResult = await pgClient.query(
         `select attributes
          from customer_profiles
          where customer_id = $1
-         limit 1`,
+         ${oneRowClause()}`,
         [instance.customer_id]
       );
-      const triggerPayload = triggerEventResult.rows[0]?.payload || {};
+      const triggerPayload = normalizeJsonField(triggerEventResult.rows[0]?.payload, {});
       const expressionContext = {
         payload: triggerPayload,
-        attributes: profileResult.rows[0]?.attributes || {},
+        attributes: normalizeJsonField(profileResult.rows[0]?.attributes, {}),
         external: {}
       };
       const customerAttributes = expressionContext.attributes || {};
@@ -1433,21 +1269,19 @@ async function evaluateDueJourney(journey) {
       }
 
       if (cacheMiss && journey.cache_lookup?.on_miss === 'fail') {
+        const exitContext = {
+          exit_reason: 'cache_miss_fail',
+          cache_dataset_key: journey.cache_lookup.dataset_key
+        };
         await pgClient.query(
           `update journey_instances
            set state = 'completed',
                current_node = 'end',
-               completed_at = now(),
-               context_json = context_json || $2::jsonb,
-               updated_at = now()
+               completed_at = current_timestamp,
+               context_json = $2,
+               updated_at = current_timestamp
            where instance_id = $1`,
-          [
-            instance.instance_id,
-            JSON.stringify({
-              exit_reason: 'cache_miss_fail',
-              cache_dataset_key: journey.cache_lookup.dataset_key
-            })
-          ]
+          [instance.instance_id, JSON.stringify(mergeJson(instance.context_json, exitContext))]
         );
         await logInstanceTransition({
           instanceId: instance.instance_id,
@@ -1560,7 +1394,7 @@ async function evaluateDueJourney(journey) {
         ? journey.action_node_map?.[selectedActionNodeId] || null
         : null;
 
-      const context = instance.context_json || {};
+      const context = normalizeJsonField(instance.context_json, {});
       const pendingActionNodeId = context.pending_action_node_id || null;
       const pendingDelayApplied = Boolean(context.pending_delay_applied);
 
@@ -1569,23 +1403,24 @@ async function evaluateDueJourney(journey) {
         selectedDelayMinutes > 0 &&
         (!pendingDelayApplied || pendingActionNodeId !== selectedActionNodeId)
       ) {
+        const delayPatch = {
+          pending_delay_applied: true,
+          pending_action_node_id: selectedActionNodeId,
+          pending_delay_minutes: selectedDelayMinutes
+        };
         await pgClient.query(
           `update journey_instances
            set state = 'waiting',
                current_node = $2,
-               due_at = now() + make_interval(mins => $3),
-               context_json = context_json || $4::jsonb,
-               updated_at = now()
+               due_at = $3,
+               context_json = $4,
+               updated_at = current_timestamp
            where instance_id = $1`,
           [
             instance.instance_id,
             selectedActionNodeId,
-            selectedDelayMinutes,
-            JSON.stringify({
-              pending_delay_applied: true,
-              pending_action_node_id: selectedActionNodeId,
-              pending_delay_minutes: selectedDelayMinutes
-            })
+            addMinutes(new Date(), selectedDelayMinutes),
+            JSON.stringify(mergeJson(instance.context_json, delayPatch))
           ]
         );
         await logInstanceTransition({
@@ -1605,22 +1440,20 @@ async function evaluateDueJourney(journey) {
       }
 
       if (!actionConfig) {
+        const exitPatch = {
+          exit_reason: conditionMatched
+            ? 'condition_true_no_action_path'
+            : 'condition_false_no_action_path'
+        };
         await pgClient.query(
           `update journey_instances
            set state = 'completed',
                current_node = 'end',
-               completed_at = now(),
-               context_json = context_json || $2::jsonb,
-               updated_at = now()
+               completed_at = current_timestamp,
+               context_json = $2,
+               updated_at = current_timestamp
            where instance_id = $1`,
-          [
-            instance.instance_id,
-            JSON.stringify({
-              exit_reason: conditionMatched
-                ? 'condition_true_no_action_path'
-                : 'condition_false_no_action_path'
-            })
-          ]
+          [instance.instance_id, JSON.stringify(mergeJson(instance.context_json, exitPatch))]
         );
         await logInstanceTransition({
           instanceId: instance.instance_id,
@@ -1721,39 +1554,40 @@ async function evaluateDueJourney(journey) {
         );
       }
 
+      const completionPatch = {
+        http_call: httpResult
+          ? {
+              type: httpResult.type,
+              reason: httpResult.reason,
+              status: httpResult.status,
+              ok: httpResult.ok
+            }
+          : null,
+        exit_reason:
+          finalAction.status === 'failed'
+            ? 'action_failed'
+            : httpResult?.type === 'timeout'
+              ? 'http_timeout_action'
+              : httpResult?.type === 'error'
+                ? 'http_error_action'
+                : conditionMatched
+                  ? 'condition_true_action'
+                  : 'condition_false_action'
+      };
       await pgClient.query(
         `update journey_instances
          set state = 'completed',
              current_node = $2,
-             completed_at = now(),
-             context_json = context_json || $3::jsonb,
-             updated_at = now()
+             completed_at = current_timestamp,
+             context_json = $3,
+             updated_at = current_timestamp
          where instance_id = $1`,
         [
           instance.instance_id,
           finalActionNodeId,
-            JSON.stringify({
-              http_call: httpResult
-                ? {
-                    type: httpResult.type,
-                    reason: httpResult.reason,
-                    status: httpResult.status,
-                    ok: httpResult.ok
-                  }
-                : null,
-              exit_reason:
-                finalAction.status === 'failed'
-                  ? 'action_failed'
-                  : httpResult?.type === 'timeout'
-                    ? 'http_timeout_action'
-                    : httpResult?.type === 'error'
-                      ? 'http_error_action'
-                  : conditionMatched
-                    ? 'condition_true_action'
-                    : 'condition_false_action'
-            })
-          ]
-        );
+          JSON.stringify(mergeJson(instance.context_json, completionPatch))
+        ]
+      );
       await logInstanceTransition({
         instanceId: instance.instance_id,
         journeyId: journey.journey_id,
@@ -1784,7 +1618,7 @@ async function evaluateDueJourney(journey) {
       console.error('Due journey processing failed:', error.message);
       await pgClient.query(
         `update journey_instances
-         set state = 'waiting', updated_at = now()
+         set state = 'waiting', updated_at = current_timestamp
          where instance_id = $1`,
         [instance.instance_id]
       );
@@ -1846,7 +1680,7 @@ async function ensureKafkaTopics() {
 }
 
 async function run() {
-  await withRetry('postgres connect', async () => {
+  await withRetry('database connect', async () => {
     const client = createPgClient();
     try {
       await client.connect();
@@ -1858,7 +1692,13 @@ async function run() {
   });
   await withRetry('redis connect', () => redisClient.connect());
   await withRetry('redis subscriber connect', () => redisSubscriber.connect());
-  await ensureSchema();
+  if (primaryDb.vendor === 'oracle') {
+    console.warn(
+      '[bootstrap] rule-engine automatic schema bootstrap is skipped for Oracle. Apply Oracle DDL manually before serving traffic.'
+    );
+  } else {
+    await ensureSchema();
+  }
   await withRetry('kafka topic ensure', () => ensureKafkaTopics());
   await refreshRuntimeJourneys();
   startHealthServer();

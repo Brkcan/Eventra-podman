@@ -7,6 +7,10 @@
     "services/*"
   ],
   "scripts": {
+    "docker:infra:up": "docker compose -f infra/docker/docker-compose.local.yml up -d",
+    "docker:infra:down": "docker compose -f infra/docker/docker-compose.local.yml down",
+    "docker:infra:logs": "docker compose -f infra/docker/docker-compose.local.yml logs -f",
+    "docker:infra:ps": "docker compose -f infra/docker/docker-compose.local.yml ps",
     "dev:api": "npm --workspace @eventra/api run dev",
     "dev:rule-engine": "npm --workspace @eventra/rule-engine run dev",
     "dev:frontend": "npm --workspace @eventra/frontend run dev",

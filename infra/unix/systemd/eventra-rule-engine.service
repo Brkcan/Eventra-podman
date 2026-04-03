@@ -1,6 +1,6 @@
 [Unit]
 Description=Eventra Rule Engine
-After=network-online.target postgresql.service redis.service eventra-api.service
+After=network-online.target redis.service eventra-api.service
 Wants=network-online.target
 
 [Service]

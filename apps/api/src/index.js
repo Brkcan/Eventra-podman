@@ -4,17 +4,24 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { Kafka, Partitioners } from 'kafkajs';
 import { createClient } from 'redis';
-import pg from 'pg';
 import { z } from 'zod';
 import { explainJourney, generateJourneyDraft, reviseJourney } from './lib/llm.js';
+import { describeDatabaseTarget, resolvePrimaryDatabaseConfig } from '../../../lib/database-config.mjs';
+import { createDatabaseClient } from '../../../lib/database-runtime.mjs';
 
 dotenv.config({ path: '../../.env' });
 
 const port = Number(process.env.PORT || 3001);
 const kafkaBrokers = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
 const kafkaClientId = process.env.KAFKA_CLIENT_ID || 'eventra-api';
-const postgresUrl = process.env.POSTGRES_URL || 'postgresql://eventra:eventra@localhost:5432/eventra';
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+const primaryDb = resolvePrimaryDatabaseConfig();
+
+console.info(
+  `[bootstrap] api primary database vendor=${primaryDb.vendor} target=${describeDatabaseTarget(
+    primaryDb
+  )}`
+);
 
 const EventInputSchema = z.object({
   event_id: z.string().optional(),
@@ -172,7 +179,7 @@ let pgClient = null;
 const redis = createClient({ url: redisUrl });
 
 function createPgClient() {
-  return new pg.Client({ connectionString: postgresUrl });
+  return createDatabaseClient(primaryDb);
 }
 
 function sleep(ms) {
@@ -216,6 +223,371 @@ function parseJsonSafe(raw, fallback = null) {
   }
 }
 
+const isOracle = primaryDb.vendor === 'oracle';
+
+function oneRowClause() {
+  return isOracle ? 'fetch first 1 rows only' : 'limit 1';
+}
+
+function paginationClause(limitIndex, offsetIndex) {
+  return isOracle
+    ? `offset $${offsetIndex} rows fetch next $${limitIndex} rows only`
+    : `limit $${limitIndex} offset $${offsetIndex}`;
+}
+
+function caseInsensitiveLike(columnRef, bindIndex) {
+  return `lower(${columnRef}) like lower($${bindIndex})`;
+}
+
+function normalizeJsonField(value, fallback) {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  if (typeof value === 'string') {
+    return parseJsonSafe(value, fallback);
+  }
+  return value;
+}
+
+function normalizeRowJsonFields(row, fields) {
+  const next = { ...row };
+  for (const field of fields) {
+    if (!(field in next)) {
+      continue;
+    }
+    const fallback = Array.isArray(next[field]) ? [] : {};
+    next[field] = normalizeJsonField(next[field], fallback);
+  }
+  return next;
+}
+
+function dateHoursAgo(hours) {
+  return new Date(Date.now() - hours * 60 * 60 * 1000);
+}
+
+function dateDaysAgo(days) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+}
+
+function oracleFetchRowsClause(limit) {
+  return `fetch first ${Math.max(1, Number(limit) || 1)} rows only`;
+}
+
+async function insertEventIfAbsent(event) {
+  const existing = await pgClient.query(
+    `select event_id
+     from events
+     where event_id = $1
+     ${oneRowClause()}`,
+    [event.event_id]
+  );
+  if (existing.rowCount > 0) {
+    return false;
+  }
+  await pgClient.query(
+    `insert into events (event_id, customer_id, event_type, ts, payload, source)
+     values ($1, $2, $3, $4, $5, $6)`,
+    [event.event_id, event.customer_id, event.event_type, event.ts, event.payload, event.source]
+  );
+  return true;
+}
+
+async function ensureFolderExists(folderPath) {
+  await pgClient.query(
+    `merge into journey_folders jf
+     using (select $1 as folder_path from dual) src
+     on (jf.folder_path = src.folder_path)
+     when not matched then
+       insert (folder_path, created_at) values (src.folder_path, current_timestamp)`,
+    [folderPath]
+  );
+}
+
+async function upsertJourneyApproval({
+  journeyId,
+  version,
+  state,
+  requestedBy = null,
+  requestedNote = '',
+  reviewedBy = null,
+  reviewedNote = ''
+}) {
+  const existing = await pgClient.query(
+    `select journey_id
+     from journey_approvals
+     where journey_id = $1 and journey_version = $2
+     ${oneRowClause()}`,
+    [journeyId, version]
+  );
+
+  if (existing.rowCount === 0) {
+    await pgClient.query(
+      `insert into journey_approvals
+        (journey_id, journey_version, state, requested_by, requested_note, requested_at,
+         reviewed_by, reviewed_note, reviewed_at, created_at, updated_at)
+       values
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, current_timestamp, current_timestamp)`,
+      [
+        journeyId,
+        version,
+        state,
+        state === 'pending' ? requestedBy : null,
+        state === 'pending' ? requestedNote : '',
+        state === 'pending' ? new Date() : null,
+        state === 'approved' || state === 'rejected' ? reviewedBy : null,
+        state === 'approved' || state === 'rejected' ? reviewedNote : '',
+        state === 'approved' || state === 'rejected' ? new Date() : null
+      ]
+    );
+    return;
+  }
+
+  if (state === 'pending') {
+    await pgClient.query(
+      `update journey_approvals
+       set state = 'pending',
+           requested_by = $3,
+           requested_note = $4,
+           requested_at = current_timestamp,
+           reviewed_by = null,
+           reviewed_note = '',
+           reviewed_at = null,
+           updated_at = current_timestamp
+       where journey_id = $1 and journey_version = $2`,
+      [journeyId, version, requestedBy, requestedNote]
+    );
+    return;
+  }
+
+  await pgClient.query(
+    `update journey_approvals
+     set state = $3,
+         reviewed_by = $4,
+         reviewed_note = $5,
+         reviewed_at = current_timestamp,
+         updated_at = current_timestamp
+     where journey_id = $1 and journey_version = $2`,
+    [journeyId, version, state, reviewedBy, reviewedNote]
+  );
+}
+
+async function upsertJourney(input) {
+  await pgClient.query(
+    `merge into journeys j
+     using (
+       select
+         $1 as journey_id,
+         $2 as version,
+         $3 as name,
+         $4 as status,
+         $5 as folder_path,
+         $6 as graph_json
+       from dual
+     ) src
+     on (j.journey_id = src.journey_id and j.version = src.version)
+     when matched then update set
+       j.name = src.name,
+       j.status = src.status,
+       j.folder_path = src.folder_path,
+       j.graph_json = src.graph_json,
+       j.updated_at = current_timestamp
+     when not matched then
+       insert (journey_id, version, name, status, folder_path, graph_json, created_at, updated_at)
+       values (
+         src.journey_id,
+         src.version,
+         src.name,
+         src.status,
+         src.folder_path,
+         src.graph_json,
+         current_timestamp,
+         current_timestamp
+       )`,
+    [
+      input.journey_id,
+      input.version,
+      input.name,
+      input.status,
+      input.folder_path,
+      JSON.stringify(input.graph_json)
+    ]
+  );
+}
+
+async function upsertGlobalPause(enabled) {
+  const payload = JSON.stringify({ enabled });
+  await pgClient.query(
+    `merge into runtime_controls rc
+     using (select 'global_pause' as key, $1 as value_json from dual) src
+     on (rc.key = src.key)
+     when matched then update set rc.value_json = src.value_json, rc.updated_at = current_timestamp
+     when not matched then
+       insert (key, value_json, updated_at) values (src.key, src.value_json, current_timestamp)`,
+    [payload]
+  );
+}
+
+async function upsertCatalogueRecord(kind, payload) {
+  if (kind === 'event_type') {
+    await pgClient.query(
+      `merge into catalogue_event_types t
+       using (
+         select $1 event_type, $2 description, $3 owner, $4 version, $5 required_fields,
+                $6 schema_json, $7 sample_payload, $8 is_active
+         from dual
+       ) src
+       on (t.event_type = src.event_type)
+       when matched then update set
+         t.description = src.description,
+         t.owner = src.owner,
+         t.version = src.version,
+         t.required_fields = src.required_fields,
+         t.schema_json = src.schema_json,
+         t.sample_payload = src.sample_payload,
+         t.is_active = src.is_active,
+         t.updated_at = current_timestamp
+       when not matched then
+         insert (
+           event_type, description, owner, version, required_fields, schema_json, sample_payload,
+           is_active, created_at, updated_at
+         ) values (
+           src.event_type, src.description, src.owner, src.version, src.required_fields, src.schema_json,
+           src.sample_payload, src.is_active, current_timestamp, current_timestamp
+         )`,
+      [
+        payload.event_type,
+        payload.description,
+        payload.owner,
+        payload.version,
+        JSON.stringify(payload.required_fields),
+        JSON.stringify(payload.schema_json),
+        JSON.stringify(payload.sample_payload),
+        payload.is_active ? 1 : 0
+      ]
+    );
+    return;
+  }
+
+  if (kind === 'segment') {
+    await pgClient.query(
+      `merge into catalogue_segments t
+       using (
+         select $1 segment_key, $2 display_name, $3 rule_expression, $4 description, $5 is_active
+         from dual
+       ) src
+       on (t.segment_key = src.segment_key)
+       when matched then update set
+         t.display_name = src.display_name,
+         t.rule_expression = src.rule_expression,
+         t.description = src.description,
+         t.is_active = src.is_active,
+         t.updated_at = current_timestamp
+       when not matched then
+         insert (
+           segment_key, display_name, rule_expression, description, is_active, created_at, updated_at
+         ) values (
+           src.segment_key, src.display_name, src.rule_expression, src.description,
+           src.is_active, current_timestamp, current_timestamp
+         )`,
+      [
+        payload.segment_key,
+        payload.display_name,
+        payload.rule_expression,
+        payload.description,
+        payload.is_active ? 1 : 0
+      ]
+    );
+    return;
+  }
+
+  if (kind === 'template') {
+    await pgClient.query(
+      `merge into catalogue_templates t
+       using (
+         select $1 template_id, $2 channel, $3 subject, $4 body, $5 variables, $6 is_active from dual
+       ) src
+       on (t.template_id = src.template_id)
+       when matched then update set
+         t.channel = src.channel,
+         t.subject = src.subject,
+         t.body = src.body,
+         t.variables = src.variables,
+         t.is_active = src.is_active,
+         t.updated_at = current_timestamp
+       when not matched then
+         insert (
+           template_id, channel, subject, body, variables, is_active, created_at, updated_at
+         ) values (
+           src.template_id, src.channel, src.subject, src.body, src.variables, src.is_active,
+           current_timestamp, current_timestamp
+         )`,
+      [
+        payload.template_id,
+        payload.channel,
+        payload.subject,
+        payload.body,
+        JSON.stringify(payload.variables),
+        payload.is_active ? 1 : 0
+      ]
+    );
+    return;
+  }
+
+  if (kind === 'endpoint') {
+    await pgClient.query(
+      `merge into catalogue_endpoints t
+       using (
+         select $1 endpoint_id, $2 method, $3 url, $4 headers, $5 timeout_ms, $6 description, $7 is_active
+         from dual
+       ) src
+       on (t.endpoint_id = src.endpoint_id)
+       when matched then update set
+         t.method = src.method,
+         t.url = src.url,
+         t.headers = src.headers,
+         t.timeout_ms = src.timeout_ms,
+         t.description = src.description,
+         t.is_active = src.is_active,
+         t.updated_at = current_timestamp
+       when not matched then
+         insert (
+           endpoint_id, method, url, headers, timeout_ms, description, is_active, created_at, updated_at
+         ) values (
+           src.endpoint_id, src.method, src.url, src.headers, src.timeout_ms, src.description,
+           src.is_active, current_timestamp, current_timestamp
+         )`,
+      [
+        payload.endpoint_id,
+        payload.method,
+        payload.url,
+        JSON.stringify(payload.headers),
+        payload.timeout_ms,
+        payload.description,
+        payload.is_active ? 1 : 0
+      ]
+    );
+    return;
+  }
+}
+
+async function upsertCustomerProfile(customerId, payload) {
+  await pgClient.query(
+    `merge into customer_profiles cp
+     using (
+       select $1 customer_id, $2 segment, $3 attributes from dual
+     ) src
+     on (cp.customer_id = src.customer_id)
+     when matched then update set
+       cp.segment = src.segment,
+       cp.attributes = src.attributes,
+       cp.updated_at = current_timestamp
+     when not matched then
+       insert (customer_id, segment, attributes, updated_at)
+       values (src.customer_id, src.segment, src.attributes, current_timestamp)`,
+    [customerId, payload.segment ?? null, JSON.stringify(payload.attributes)]
+  );
+}
+
 async function resolveJourneyVersion(journeyId, versionRaw) {
   if (versionRaw !== undefined && versionRaw !== null && String(versionRaw).trim() !== '') {
     const parsed = Number(versionRaw);
@@ -230,7 +602,7 @@ async function resolveJourneyVersion(journeyId, versionRaw) {
      from journeys
      where journey_id = $1
      order by version desc
-     limit 1`,
+     ${oneRowClause()}`,
     [journeyId]
   );
   if (latest.rowCount === 0) {
@@ -244,14 +616,15 @@ async function resolveWaitNodeId(journeyId, version, waitNodeIdRaw) {
     `select graph_json
      from journeys
      where journey_id = $1 and version = $2
-     limit 1`,
+     ${oneRowClause()}`,
     [journeyId, version]
   );
   if (journey.rowCount === 0) {
     throw new Error('journey version not found');
   }
 
-  const nodes = Array.isArray(journey.rows[0]?.graph_json?.nodes) ? journey.rows[0].graph_json.nodes : [];
+  const graph = normalizeJsonField(journey.rows[0]?.graph_json, {});
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const waitNodes = nodes.filter((node) => {
     const nodeKind = node?.data?.node_kind || node?.type;
     return nodeKind === 'wait';
@@ -280,34 +653,34 @@ async function loadAiCatalogContext() {
        from catalogue_event_types
        where is_active = true
        order by event_type asc
-       limit 100`
+       fetch first 100 rows only`
     ),
     pgClient.query(
       `select template_id, channel
        from catalogue_templates
        where is_active = true
        order by template_id asc
-       limit 100`
+       fetch first 100 rows only`
     ),
     pgClient.query(
       `select segment_key
        from catalogue_segments
        where is_active = true
        order by segment_key asc
-       limit 100`
+       fetch first 100 rows only`
     ),
     pgClient.query(
       `select endpoint_id, method
        from catalogue_endpoints
        where is_active = true
        order by endpoint_id asc
-       limit 100`
+       fetch first 100 rows only`
     ),
     pgClient.query(
       `select distinct dataset_key
        from cache_loader_jobs
        order by dataset_key asc
-       limit 100`
+       fetch first 100 rows only`
     )
   ]);
 
@@ -357,356 +730,11 @@ async function ensureKafkaTopics() {
 }
 
 async function ensureSchema() {
-  await pgClient.query(`
-    create table if not exists events (
-      event_id text primary key,
-      customer_id text not null,
-      event_type text not null,
-      ts timestamptz not null,
-      payload jsonb not null,
-      source text not null
-    )
-  `);
-  await pgClient.query(`
-    create index if not exists idx_events_customer_type_ts
-      on events (customer_id, event_type, ts desc)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_events_customer_ts
-      on events (customer_id, ts desc)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_events_ts_brin
-      on events using brin (ts)
-  `);
-
-  await pgClient.query(`
-    create table if not exists customer_profiles (
-      customer_id text primary key,
-      segment text,
-      attributes jsonb not null default '{}'::jsonb,
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists action_log (
-      action_id text primary key,
-      event_id text not null,
-      customer_id text not null,
-      journey_id text,
-      journey_version int,
-      journey_node_id text,
-      channel text not null,
-      status text not null,
-      message text not null,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(
-    `alter table action_log add column if not exists journey_id text`
-  );
-  await pgClient.query(
-    `alter table action_log add column if not exists journey_version int`
-  );
-  await pgClient.query(
-    `alter table action_log add column if not exists journey_node_id text`
-  );
-
-  await pgClient.query(`
-    create table if not exists external_call_log (
-      id text primary key,
-      instance_id text not null,
-      journey_id text not null,
-      journey_version int not null,
-      customer_id text not null,
-      journey_node_id text not null,
-      method text not null,
-      url text not null,
-      status_code int not null default 0,
-      result_type text not null,
-      reason text not null,
-      response_json jsonb,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_external_call_log_lookup
-      on external_call_log (journey_id, journey_version, customer_id, created_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists journeys (
-      journey_id text not null,
-      version int not null,
-      name text not null,
-      status text not null default 'published',
-      folder_path text not null default 'Workspace',
-      graph_json jsonb not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, version)
-    )
-  `);
-  await pgClient.query(
-    `alter table journeys add column if not exists folder_path text not null default 'Workspace'`
-  );
-
-  await pgClient.query(`
-    create table if not exists journey_folders (
-      folder_path text primary key,
-      created_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists journey_instances (
-      instance_id text primary key,
-      journey_id text not null,
-      journey_version int not null,
-      customer_id text not null,
-      state text not null,
-      current_node text not null,
-      started_at timestamptz not null,
-      due_at timestamptz,
-      completed_at timestamptz,
-      last_event_id text,
-      context_json jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    drop index if exists uq_journey_instance_active
-  `);
-  await pgClient.query(`
-    create unique index uq_journey_instance_active
-      on journey_instances (journey_id, customer_id)
-      where state in ('waiting', 'waiting_manual', 'active', 'processing')
-  `);
-
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_due
-      on journey_instances (state, due_at)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_journey_state_due
-      on journey_instances (journey_id, state, due_at)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_customer_updated
-      on journey_instances (customer_id, updated_at desc)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_journey_instances_updated
-      on journey_instances (updated_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists event_dlq (
-      id text primary key,
-      event_id text,
-      customer_id text,
-      event_type text,
-      source_topic text not null,
-      error_message text not null,
-      raw_payload jsonb,
-      created_at timestamptz not null default now()
-    )
-  `);
-  await pgClient.query(`
-    create index if not exists idx_event_dlq_created
-      on event_dlq (created_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists journey_instance_transitions (
-      id text primary key,
-      instance_id text not null,
-      journey_id text not null,
-      journey_version int not null,
-      customer_id text not null,
-      from_state text,
-      to_state text not null,
-      from_node text,
-      to_node text,
-      reason text,
-      event_id text,
-      metadata_json jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now()
-    )
-  `);
-  await pgClient.query(`
-    create index if not exists idx_instance_transitions_lookup
-      on journey_instance_transitions (instance_id, created_at desc)
-  `);
-  await pgClient.query(`
-    create index if not exists idx_instance_transitions_customer
-      on journey_instance_transitions (customer_id, created_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists consumed_events (
-      consumer_group text not null,
-      event_id text not null,
-      consumed_at timestamptz not null default now(),
-      primary key (consumer_group, event_id)
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists edge_capacity_usage (
-      journey_id text not null,
-      journey_version int not null,
-      edge_id text not null,
-      window_type text not null,
-      window_start timestamptz not null,
-      used_count int not null default 0,
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, journey_version, edge_id, window_type, window_start)
-    )
-  `);
-  await pgClient.query(`
-    create index if not exists idx_edge_capacity_lookup
-      on edge_capacity_usage (journey_id, journey_version, edge_id, window_type, window_start desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists journey_release_controls (
-      journey_id text not null,
-      journey_version int not null,
-      rollout_percent int not null default 100,
-      release_paused boolean not null default false,
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, journey_version)
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists journey_approvals (
-      journey_id text not null,
-      journey_version int not null,
-      state text not null,
-      requested_by text,
-      requested_note text not null default '',
-      requested_at timestamptz,
-      reviewed_by text,
-      reviewed_note text not null default '',
-      reviewed_at timestamptz,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      primary key (journey_id, journey_version)
-    )
-  `);
-  await pgClient.query(`
-    create index if not exists idx_journey_approvals_state_updated
-      on journey_approvals (state, updated_at desc)
-  `);
-
-  await pgClient.query(`
-    create table if not exists runtime_controls (
-      key text primary key,
-      value_json jsonb not null default '{}'::jsonb,
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(`
-    create table if not exists catalogue_event_types (
-      event_type text primary key,
-      description text not null default '',
-      owner text not null default '',
-      version int not null default 1,
-      required_fields jsonb not null default '[]'::jsonb,
-      schema_json jsonb not null default '{}'::jsonb,
-      sample_payload jsonb not null default '{}'::jsonb,
-      is_active boolean not null default true,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-  await pgClient.query(
-    `alter table catalogue_event_types add column if not exists owner text not null default ''`
-  );
-  await pgClient.query(
-    `alter table catalogue_event_types add column if not exists version int not null default 1`
-  );
-  await pgClient.query(
-    `alter table catalogue_event_types add column if not exists required_fields jsonb not null default '[]'::jsonb`
-  );
-  await pgClient.query(
-    `alter table catalogue_event_types add column if not exists schema_json jsonb not null default '{}'::jsonb`
-  );
-
-  await pgClient.query(`
-    create table if not exists catalogue_segments (
-      segment_key text primary key,
-      display_name text not null default '',
-      rule_expression text not null default '',
-      description text not null default '',
-      is_active boolean not null default true,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-  await pgClient.query(`
-    create table if not exists catalogue_templates (
-      template_id text primary key,
-      channel text not null,
-      subject text not null default '',
-      body text not null default '',
-      variables jsonb not null default '[]'::jsonb,
-      is_active boolean not null default true,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-  await pgClient.query(`
-    create table if not exists catalogue_endpoints (
-      endpoint_id text primary key,
-      method text not null,
-      url text not null,
-      headers jsonb not null default '{}'::jsonb,
-      timeout_ms int not null default 5000,
-      description text not null default '',
-      is_active boolean not null default true,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await pgClient.query(
-    `insert into runtime_controls (key, value_json)
-     values ('global_pause', '{"enabled": false}'::jsonb)
-     on conflict (key) do nothing`
-  );
-
-  await pgClient.query(
-    `insert into journeys (journey_id, version, name, status, graph_json)
-     values ($1, $2, $3, $4, $5)
-     on conflict (journey_id, version) do nothing`,
-    [
-      'cart_abandonment_v1',
-      1,
-      'Cart Abandonment 30m',
-      'published',
-      {
-        nodes: [
-          { id: 'trigger', type: 'trigger', event_type: 'cart_add' },
-          { id: 'wait', type: 'wait', duration_minutes: 30 },
-          { id: 'condition', type: 'condition', check: 'purchase_exists' },
-          { id: 'action', type: 'action', channel: 'email' }
-        ]
-      }
-    ]
-  );
+  return;
 }
 
 async function bootstrap() {
-  await withRetry('postgres connect', async () => {
+  await withRetry('database connect', async () => {
     const client = createPgClient();
     try {
       await client.connect();
@@ -720,7 +748,9 @@ async function bootstrap() {
   await withRetry('kafka producer connect', () => producer.connect());
   await withRetry('kafka topic ensure', () => ensureKafkaTopics());
 
-  await ensureSchema();
+  console.warn(
+    '[bootstrap] api automatic schema bootstrap is skipped for Oracle. Apply Oracle DDL manually before serving traffic.'
+  );
 }
 
 function normalizeEvent(input) {
@@ -838,33 +868,40 @@ app.post('/ai/revise-journey', async (req, res) => {
 
 app.get('/dashboard/kpi', async (_req, res) => {
   try {
-    const [eventsResult, activeResult, completedResult, actionResult] = await Promise.all([
-      pgClient.query(
-        `select
-           count(*) filter (where ts >= now() - interval '1 hour')::int as events_1h,
-           count(*) filter (where ts >= now() - interval '24 hour')::int as events_24h
-         from events`
-      ),
-      pgClient.query(
-        `select state, count(*)::int as cnt
-         from journey_instances
-         where state in ('waiting', 'waiting_manual', 'processing')
-         group by state`
-      ),
-      pgClient.query(
-        `select count(*)::int as completed_24h
-         from journey_instances
-         where state = 'completed'
-           and completed_at >= now() - interval '24 hour'`
-      ),
-      pgClient.query(
-        `select
-           count(*) filter (where status = 'failed')::int as failed_24h,
-           count(*) filter (where status <> 'failed')::int as success_24h
-         from action_log
-         where created_at >= now() - interval '24 hour'`
-      )
-    ]);
+    const oneHourAgo = dateHoursAgo(1);
+    const oneDayAgo = dateDaysAgo(1);
+    const [events1h, events24h, activeResult, completedResult, failedResult, successResult] =
+      await Promise.all([
+        pgClient.query(`select count(*) as total from events where ts >= $1`, [oneHourAgo]),
+        pgClient.query(`select count(*) as total from events where ts >= $1`, [oneDayAgo]),
+        pgClient.query(
+          `select state, count(*) as cnt
+           from journey_instances
+           where state in ('waiting', 'waiting_manual', 'processing')
+           group by state`
+        ),
+        pgClient.query(
+          `select count(*) as completed_24h
+           from journey_instances
+           where state = 'completed'
+             and completed_at >= $1`,
+          [oneDayAgo]
+        ),
+        pgClient.query(
+          `select count(*) as failed_24h
+           from action_log
+           where created_at >= $1
+             and status = 'failed'`,
+          [oneDayAgo]
+        ),
+        pgClient.query(
+          `select count(*) as success_24h
+           from action_log
+           where created_at >= $1
+             and status <> 'failed'`,
+          [oneDayAgo]
+        )
+      ]);
 
     const activeByState = { waiting: 0, waiting_manual: 0, processing: 0 };
     for (const row of activeResult.rows) {
@@ -872,8 +909,8 @@ app.get('/dashboard/kpi', async (_req, res) => {
     }
     const activeTotal = activeByState.waiting + activeByState.waiting_manual + activeByState.processing;
 
-    const success24h = Number(actionResult.rows[0]?.success_24h || 0);
-    const failed24h = Number(actionResult.rows[0]?.failed_24h || 0);
+    const success24h = Number(successResult.rows[0]?.success_24h || 0);
+    const failed24h = Number(failedResult.rows[0]?.failed_24h || 0);
     const actionTotal24h = success24h + failed24h;
     const successRate24h = actionTotal24h > 0 ? Number(((success24h / actionTotal24h) * 100).toFixed(2)) : 0;
     const failureRate24h = actionTotal24h > 0 ? Number(((failed24h / actionTotal24h) * 100).toFixed(2)) : 0;
@@ -881,8 +918,8 @@ app.get('/dashboard/kpi', async (_req, res) => {
     res.status(200).json({
       status: 'ok',
       item: {
-        events_1h: Number(eventsResult.rows[0]?.events_1h || 0),
-        events_24h: Number(eventsResult.rows[0]?.events_24h || 0),
+        events_1h: Number(events1h.rows[0]?.total || 0),
+        events_24h: Number(events24h.rows[0]?.total || 0),
         active_instances: {
           ...activeByState,
           total: activeTotal
@@ -904,76 +941,110 @@ app.get('/dashboard/kpi', async (_req, res) => {
 
 app.get('/dashboard/journey-performance', async (_req, res) => {
   try {
-    const result = await pgClient.query(
-      `with trigger_stats as (
-         select journey_id, journey_version, count(*)::int as triggered_24h
-         from journey_instances
-         where started_at >= now() - interval '24 hour'
-         group by journey_id, journey_version
-       ),
-       completion_stats as (
-         select journey_id, journey_version, count(*)::int as completed_24h
-         from journey_instances
-         where completed_at >= now() - interval '24 hour'
-         group by journey_id, journey_version
-       ),
-       fail_stats as (
-         select journey_id, journey_version, count(*)::int as failed_actions_24h
-         from action_log
-         where created_at >= now() - interval '24 hour'
-           and status = 'failed'
-         group by journey_id, journey_version
-       ),
-       wait_stats as (
-         select
-           journey_id,
-           journey_version,
-           avg(extract(epoch from (processing_at - wait_at)))::numeric(12,2) as avg_wait_seconds
-         from (
-           select
-             journey_id,
-             journey_version,
-             instance_id,
-             min(created_at) filter (where to_state in ('waiting', 'waiting_manual')) as wait_at,
-             min(created_at) filter (where to_state = 'processing') as processing_at
+    const oneDayAgo = dateDaysAgo(1);
+    const [journeysResult, triggeredResult, completedResult, failedResult, transitionsResult] =
+      await Promise.all([
+        pgClient.query(
+          `select journey_id, version as journey_version, name, updated_at
+           from journeys
+           where status in ('published', 'draft')
+           order by updated_at desc
+           ${isOracle ? 'fetch first 200 rows only' : 'limit 200'}`
+        ),
+        pgClient.query(
+          `select journey_id, journey_version, count(*) as triggered_24h
+           from journey_instances
+           where started_at >= $1
+           group by journey_id, journey_version`,
+          [oneDayAgo]
+        ),
+        pgClient.query(
+          `select journey_id, journey_version, count(*) as completed_24h
+           from journey_instances
+           where completed_at >= $1
+           group by journey_id, journey_version`,
+          [oneDayAgo]
+        ),
+        pgClient.query(
+          `select journey_id, journey_version, count(*) as failed_actions_24h
+           from action_log
+           where created_at >= $1
+             and status = 'failed'
+           group by journey_id, journey_version`,
+          [oneDayAgo]
+        ),
+        pgClient.query(
+          `select journey_id, journey_version, instance_id, to_state, created_at
            from journey_instance_transitions
-           where created_at >= now() - interval '24 hour'
-           group by journey_id, journey_version, instance_id
-         ) t
-         where wait_at is not null and processing_at is not null and processing_at >= wait_at
-         group by journey_id, journey_version
-       )
-       select
-         j.journey_id,
-         j.version as journey_version,
-         j.name,
-         coalesce(ts.triggered_24h, 0)::int as triggered_24h,
-         coalesce(cs.completed_24h, 0)::int as completed_24h,
-         coalesce(fs.failed_actions_24h, 0)::int as failed_actions_24h,
-         coalesce(ws.avg_wait_seconds, 0)::numeric(12,2) as avg_wait_seconds
-       from journeys j
-       left join trigger_stats ts
-         on ts.journey_id = j.journey_id and ts.journey_version = j.version
-       left join completion_stats cs
-         on cs.journey_id = j.journey_id and cs.journey_version = j.version
-       left join fail_stats fs
-         on fs.journey_id = j.journey_id and fs.journey_version = j.version
-       left join wait_stats ws
-         on ws.journey_id = j.journey_id and ws.journey_version = j.version
-       where j.status in ('published', 'draft')
-       order by triggered_24h desc, failed_actions_24h desc, j.updated_at desc
-       limit 200`
+           where created_at >= $1
+             and to_state in ('waiting', 'waiting_manual', 'processing')`,
+          [oneDayAgo]
+        )
+      ]);
+
+    const triggeredMap = new Map(
+      triggeredResult.rows.map((row) => [
+        `${row.journey_id}::${row.journey_version}`,
+        Number(row.triggered_24h || 0)
+      ])
+    );
+    const completedMap = new Map(
+      completedResult.rows.map((row) => [
+        `${row.journey_id}::${row.journey_version}`,
+        Number(row.completed_24h || 0)
+      ])
+    );
+    const failedMap = new Map(
+      failedResult.rows.map((row) => [
+        `${row.journey_id}::${row.journey_version}`,
+        Number(row.failed_actions_24h || 0)
+      ])
     );
 
-    const rows = result.rows.map((row) => ({
-      journey_id: row.journey_id,
-      journey_version: Number(row.journey_version),
-      name: row.name || row.journey_id,
-      triggered_24h: Number(row.triggered_24h || 0),
-      completed_24h: Number(row.completed_24h || 0),
-      failed_actions_24h: Number(row.failed_actions_24h || 0),
-      avg_wait_seconds: Number(row.avg_wait_seconds || 0)
-    }));
+    const waitStatsByJourney = new Map();
+    for (const row of transitionsResult.rows) {
+      const key = `${row.journey_id}::${row.journey_version}::${row.instance_id}`;
+      const createdAt = new Date(row.created_at).getTime();
+      if (Number.isNaN(createdAt)) {
+        continue;
+      }
+      const current =
+        waitStatsByJourney.get(key) || { journeyKey: `${row.journey_id}::${row.journey_version}` };
+      if ((row.to_state === 'waiting' || row.to_state === 'waiting_manual') && !current.waitAt) {
+        current.waitAt = createdAt;
+      }
+      if (row.to_state === 'processing' && !current.processingAt) {
+        current.processingAt = createdAt;
+      }
+      waitStatsByJourney.set(key, current);
+    }
+
+    const avgWaitByJourney = new Map();
+    for (const item of waitStatsByJourney.values()) {
+      if (!item.waitAt || !item.processingAt || item.processingAt < item.waitAt) {
+        continue;
+      }
+      const deltaSeconds = (item.processingAt - item.waitAt) / 1000;
+      const current = avgWaitByJourney.get(item.journeyKey) || { total: 0, count: 0 };
+      current.total += deltaSeconds;
+      current.count += 1;
+      avgWaitByJourney.set(item.journeyKey, current);
+    }
+
+    const rows = journeysResult.rows.map((row) => {
+      const journeyKey = `${row.journey_id}::${row.journey_version}`;
+      const avgWait = avgWaitByJourney.get(journeyKey);
+      return {
+        journey_id: row.journey_id,
+        journey_version: Number(row.journey_version),
+        name: row.name || row.journey_id,
+        triggered_24h: triggeredMap.get(journeyKey) || 0,
+        completed_24h: completedMap.get(journeyKey) || 0,
+        failed_actions_24h: failedMap.get(journeyKey) || 0,
+        avg_wait_seconds:
+          avgWait && avgWait.count > 0 ? Number((avgWait.total / avgWait.count).toFixed(2)) : 0
+      };
+    });
 
     const topByEvents = [...rows]
       .sort((a, b) => b.triggered_24h - a.triggered_24h)
@@ -997,82 +1068,90 @@ app.get('/dashboard/journey-performance', async (_req, res) => {
 
 app.get('/dashboard/cache-health', async (_req, res) => {
   try {
-    const summaryResult = await pgClient.query(
-      `with latest as (
-         select
-           j.dataset_key,
-           max(r.started_at) as last_run_at,
-           max(r.started_at) filter (where r.status = 'success') as last_success_at
-         from cache_loader_jobs j
-         left join cache_loader_runs r on r.job_id = j.id
-         group by j.dataset_key
-       ),
-       latest_success as (
-         select distinct on (j.dataset_key)
-           j.dataset_key,
-           r.row_count,
-           r.started_at
-         from cache_loader_jobs j
-         join cache_loader_runs r on r.job_id = j.id
-         where r.status = 'success'
-         order by j.dataset_key, r.started_at desc
-       )
-       select
-         (select count(*)::int from latest) as datasets_total,
-         (select count(*)::int from latest where last_success_at >= date_trunc('day', now())) as datasets_loaded_today,
-         (select count(*)::int from cache_loader_runs where status = 'success' and started_at >= date_trunc('day', now())) as success_runs_today,
-         coalesce((select sum(row_count)::int from latest_success), 0) as total_rows_last_success`
-    );
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
 
-    const itemsResult = await pgClient.query(
-      `with latest_success as (
-         select distinct on (j.dataset_key)
-           j.dataset_key,
-           r.started_at as last_success_at,
-           r.row_count as last_success_row_count
-         from cache_loader_jobs j
-         join cache_loader_runs r on r.job_id = j.id
-         where r.status = 'success'
-         order by j.dataset_key, r.started_at desc
-       ),
-       latest_run as (
-         select distinct on (j.dataset_key)
-           j.dataset_key,
-           r.started_at as last_run_at,
-           r.status as last_run_status,
-           r.error_text as last_error
-         from cache_loader_jobs j
-         left join cache_loader_runs r on r.job_id = j.id
-         order by j.dataset_key, r.started_at desc nulls last
-       )
-       select
-         k.dataset_key,
-         lr.last_run_at,
-         lr.last_run_status,
-         ls.last_success_at,
-         coalesce(ls.last_success_row_count, 0)::int as last_success_row_count,
-         coalesce(ls.last_success_at >= date_trunc('day', now()), false) as loaded_today,
-         lr.last_error
-       from (select distinct dataset_key from cache_loader_jobs) k
-       left join latest_run lr on lr.dataset_key = k.dataset_key
-       left join latest_success ls on ls.dataset_key = k.dataset_key
-       order by k.dataset_key asc`
-    );
+    const [jobsResult, runsResult] = await Promise.all([
+      pgClient.query(`select id, dataset_key from cache_loader_jobs`),
+      pgClient.query(
+        `select job_id, started_at, status, row_count, error_text
+         from cache_loader_runs
+         order by started_at desc`
+      )
+    ]);
+
+    const jobToDataset = new Map(jobsResult.rows.map((row) => [row.id, row.dataset_key]));
+    const datasetMap = new Map();
+    let successRunsToday = 0;
+
+    for (const run of runsResult.rows) {
+      const datasetKey = jobToDataset.get(run.job_id);
+      if (!datasetKey) {
+        continue;
+      }
+      const startedAt = run.started_at ? new Date(run.started_at) : null;
+      const dataset =
+        datasetMap.get(datasetKey) || {
+          dataset_key: datasetKey,
+          last_run_at: null,
+          last_run_status: null,
+          last_success_at: null,
+          last_success_row_count: 0,
+          loaded_today: false,
+          last_error: null
+        };
+
+      if (!dataset.last_run_at) {
+        dataset.last_run_at = run.started_at || null;
+        dataset.last_run_status = run.status || null;
+        dataset.last_error = run.error_text || null;
+      }
+
+      if (run.status === 'success') {
+        if (startedAt && startedAt >= startOfDay) {
+          successRunsToday += 1;
+        }
+        if (!dataset.last_success_at) {
+          dataset.last_success_at = run.started_at || null;
+          dataset.last_success_row_count = Number(run.row_count || 0);
+          dataset.loaded_today = Boolean(startedAt && startedAt >= startOfDay);
+        }
+      }
+
+      datasetMap.set(datasetKey, dataset);
+    }
+
+    for (const row of jobsResult.rows) {
+      if (!datasetMap.has(row.dataset_key)) {
+        datasetMap.set(row.dataset_key, {
+          dataset_key: row.dataset_key,
+          last_run_at: null,
+          last_run_status: null,
+          last_success_at: null,
+          last_success_row_count: 0,
+          loaded_today: false,
+          last_error: null
+        });
+      }
+    }
+
+    const items = [...datasetMap.values()].sort((a, b) => a.dataset_key.localeCompare(b.dataset_key));
+    const summary = {
+      datasets_total: items.length,
+      datasets_loaded_today: items.filter((item) => item.loaded_today).length,
+      success_runs_today: successRunsToday,
+      total_rows_last_success: items.reduce((sum, item) => sum + Number(item.last_success_row_count || 0), 0)
+    };
 
     res.status(200).json({
       status: 'ok',
       item: {
-        summary: summaryResult.rows[0] || {
-          datasets_total: 0,
-          datasets_loaded_today: 0,
-          success_runs_today: 0,
-          total_rows_last_success: 0
-        },
-        items: itemsResult.rows || []
+        summary,
+        items
       }
     });
   } catch (error) {
-    if (error?.code === '42P01') {
+    if (error?.code === '42P01' || error?.errorNum === 942) {
       res.status(200).json({
         status: 'ok',
         item: {
@@ -1097,9 +1176,10 @@ app.get('/management/global-pause', async (_req, res) => {
       `select value_json
        from runtime_controls
        where key = 'global_pause'
-       limit 1`
+       ${oneRowClause()}`
     );
-    const enabled = Boolean(result.rows[0]?.value_json?.enabled);
+    const valueJson = normalizeJsonField(result.rows[0]?.value_json, {});
+    const enabled = Boolean(valueJson?.enabled);
     res.status(200).json({ status: 'ok', item: { enabled } });
   } catch (error) {
     res.status(500).json({ status: 'error', message: error.message });
@@ -1109,13 +1189,7 @@ app.get('/management/global-pause', async (_req, res) => {
 app.put('/management/global-pause', async (req, res) => {
   try {
     const payload = GlobalPauseUpdateSchema.parse(req.body);
-    await pgClient.query(
-      `insert into runtime_controls (key, value_json, updated_at)
-       values ('global_pause', $1::jsonb, now())
-       on conflict (key)
-       do update set value_json = excluded.value_json, updated_at = now()`,
-      [JSON.stringify({ enabled: payload.enabled })]
-    );
+    await upsertGlobalPause(payload.enabled);
     res.status(200).json({ status: 'ok', item: { enabled: payload.enabled } });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
@@ -1135,7 +1209,7 @@ app.get('/management/release-controls', async (_req, res) => {
          l.version as journey_version,
          l.name,
          l.status,
-         coalesce(rc.rollout_percent, 100)::int as rollout_percent,
+         coalesce(rc.rollout_percent, 100) as rollout_percent,
          coalesce(rc.release_paused, false) as release_paused,
          coalesce(rc.updated_at, l.updated_at) as updated_at
        from latest l
@@ -1160,22 +1234,26 @@ app.put('/management/release-controls/:journeyId', async (req, res) => {
       `select rollout_percent, release_paused
        from journey_release_controls
        where journey_id = $1 and journey_version = $2
-       limit 1`,
+       ${oneRowClause()}`,
       [journeyId, version]
     );
     const rolloutPercent = payload.rollout_percent ?? Number(existing.rows[0]?.rollout_percent ?? 100);
     const releasePaused = payload.release_paused ?? Boolean(existing.rows[0]?.release_paused ?? false);
 
     await pgClient.query(
-      `insert into journey_release_controls
-        (journey_id, journey_version, rollout_percent, release_paused, updated_at)
-       values ($1, $2, $3, $4, now())
-       on conflict (journey_id, journey_version)
-       do update set
-         rollout_percent = excluded.rollout_percent,
-         release_paused = excluded.release_paused,
-         updated_at = now()`,
-      [journeyId, version, rolloutPercent, releasePaused]
+      `merge into journey_release_controls rc
+       using (
+         select $1 journey_id, $2 journey_version, $3 rollout_percent, $4 release_paused from dual
+       ) src
+       on (rc.journey_id = src.journey_id and rc.journey_version = src.journey_version)
+       when matched then update set
+         rc.rollout_percent = src.rollout_percent,
+         rc.release_paused = src.release_paused,
+         rc.updated_at = current_timestamp
+       when not matched then
+         insert (journey_id, journey_version, rollout_percent, release_paused, updated_at)
+         values (src.journey_id, src.journey_version, src.rollout_percent, src.release_paused, current_timestamp)`,
+      [journeyId, version, rolloutPercent, releasePaused ? 1 : 0]
     );
 
     res.status(200).json({
@@ -1194,36 +1272,40 @@ app.put('/management/release-controls/:journeyId', async (req, res) => {
 
 app.get('/catalogues/summary', async (_req, res) => {
   try {
+    const summaryQuery = (tableName) =>
+      pgClient.query(
+        `select
+           count(*) as total,
+           sum(case when is_active = ${isOracle ? 1 : 'true'} then 1 else 0 end) as active_total
+         from ${tableName}`
+      );
+
     const [events, templates, endpoints, segments] = await Promise.all([
-      pgClient.query(
-        `select count(*)::int as total,
-                count(*) filter (where is_active = true)::int as active_total
-         from catalogue_event_types`
-      ),
-      pgClient.query(
-        `select count(*)::int as total,
-                count(*) filter (where is_active = true)::int as active_total
-         from catalogue_templates`
-      ),
-      pgClient.query(
-        `select count(*)::int as total,
-                count(*) filter (where is_active = true)::int as active_total
-         from catalogue_endpoints`
-      ),
-      pgClient.query(
-        `select count(*)::int as total,
-                count(*) filter (where is_active = true)::int as active_total
-         from catalogue_segments`
-      )
+      summaryQuery('catalogue_event_types'),
+      summaryQuery('catalogue_templates'),
+      summaryQuery('catalogue_endpoints'),
+      summaryQuery('catalogue_segments')
     ]);
 
     res.status(200).json({
       status: 'ok',
       item: {
-        event_types: events.rows[0] || { total: 0, active_total: 0 },
-        templates: templates.rows[0] || { total: 0, active_total: 0 },
-        endpoints: endpoints.rows[0] || { total: 0, active_total: 0 },
-        segments: segments.rows[0] || { total: 0, active_total: 0 }
+        event_types: {
+          total: Number(events.rows[0]?.total || 0),
+          active_total: Number(events.rows[0]?.active_total || 0)
+        },
+        templates: {
+          total: Number(templates.rows[0]?.total || 0),
+          active_total: Number(templates.rows[0]?.active_total || 0)
+        },
+        endpoints: {
+          total: Number(endpoints.rows[0]?.total || 0),
+          active_total: Number(endpoints.rows[0]?.active_total || 0)
+        },
+        segments: {
+          total: Number(segments.rows[0]?.total || 0),
+          active_total: Number(segments.rows[0]?.active_total || 0)
+        }
       }
     });
   } catch (error) {
@@ -1291,16 +1373,16 @@ app.get('/catalogues/event-types', async (_req, res) => {
 
     if (q) {
       values.push(`%${q}%`);
-      where = `where event_type ilike $1 or description ilike $1`;
+      where = `where ${caseInsensitiveLike('event_type', 1)} or ${caseInsensitiveLike('description', 1)}`;
     }
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from catalogue_event_types
        ${where}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -1309,14 +1391,22 @@ app.get('/catalogues/event-types', async (_req, res) => {
        from catalogue_event_types
        ${where}
        order by updated_at desc, event_type asc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) =>
+        normalizeRowJsonFields(
+          {
+            ...row,
+            version: Number(row.version || 0),
+            is_active: Boolean(row.is_active)
+          },
+          ['required_fields', 'schema_json', 'sample_payload']
+        )
+      ),
       meta: { limit, offset, total, has_more: offset + result.rows.length < total }
     });
   } catch (error) {
@@ -1327,31 +1417,7 @@ app.get('/catalogues/event-types', async (_req, res) => {
 app.post('/catalogues/event-types', async (req, res) => {
   try {
     const payload = CatalogueEventTypeSchema.parse(req.body);
-    await pgClient.query(
-      `insert into catalogue_event_types
-        (event_type, description, owner, version, required_fields, schema_json, sample_payload, is_active, updated_at)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, now())
-       on conflict (event_type)
-       do update set
-         description = excluded.description,
-         owner = excluded.owner,
-         version = excluded.version,
-         required_fields = excluded.required_fields,
-         schema_json = excluded.schema_json,
-         sample_payload = excluded.sample_payload,
-         is_active = excluded.is_active,
-         updated_at = now()`,
-      [
-        payload.event_type,
-        payload.description,
-        payload.owner,
-        payload.version,
-        payload.required_fields,
-        payload.schema_json,
-        payload.sample_payload,
-        payload.is_active
-      ]
-    );
+    await upsertCatalogueRecord('event_type', payload);
     res.status(200).json({ status: 'ok', event_type: payload.event_type });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
@@ -1371,7 +1437,7 @@ app.put('/catalogues/event-types/:eventType', async (req, res) => {
            schema_json = $6,
            sample_payload = $7,
            is_active = $8,
-           updated_at = now()
+           updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where event_type = $1`,
       [
         payload.event_type,
@@ -1404,16 +1470,19 @@ app.get('/catalogues/segments', async (_req, res) => {
 
     if (q) {
       values.push(`%${q}%`);
-      where = `where segment_key ilike $1 or display_name ilike $1 or description ilike $1`;
+      where = `where ${caseInsensitiveLike('segment_key', 1)} or ${caseInsensitiveLike(
+        'display_name',
+        1
+      )} or ${caseInsensitiveLike('description', 1)}`;
     }
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from catalogue_segments
        ${where}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -1421,14 +1490,13 @@ app.get('/catalogues/segments', async (_req, res) => {
        from catalogue_segments
        ${where}
        order by updated_at desc, segment_key asc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) => ({ ...row, is_active: Boolean(row.is_active) })),
       meta: { limit, offset, total, has_more: offset + result.rows.length < total }
     });
   } catch (error) {
@@ -1439,25 +1507,7 @@ app.get('/catalogues/segments', async (_req, res) => {
 app.post('/catalogues/segments', async (req, res) => {
   try {
     const payload = CatalogueSegmentSchema.parse(req.body);
-    await pgClient.query(
-      `insert into catalogue_segments
-        (segment_key, display_name, rule_expression, description, is_active, updated_at)
-       values ($1, $2, $3, $4, $5, now())
-       on conflict (segment_key)
-       do update set
-         display_name = excluded.display_name,
-         rule_expression = excluded.rule_expression,
-         description = excluded.description,
-         is_active = excluded.is_active,
-         updated_at = now()`,
-      [
-        payload.segment_key,
-        payload.display_name,
-        payload.rule_expression,
-        payload.description,
-        payload.is_active
-      ]
-    );
+    await upsertCatalogueRecord('segment', payload);
     res.status(200).json({ status: 'ok', segment_key: payload.segment_key });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
@@ -1473,7 +1523,7 @@ app.put('/catalogues/segments/:segmentKey', async (req, res) => {
            rule_expression = $3,
            description = $4,
            is_active = $5,
-           updated_at = now()
+           updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where segment_key = $1`,
       [
         payload.segment_key,
@@ -1537,16 +1587,19 @@ app.get('/catalogues/templates', async (_req, res) => {
 
     if (q) {
       values.push(`%${q}%`);
-      where = `where template_id ilike $1 or body ilike $1 or subject ilike $1`;
+      where = `where ${caseInsensitiveLike('template_id', 1)} or ${caseInsensitiveLike(
+        'body',
+        1
+      )} or ${caseInsensitiveLike('subject', 1)}`;
     }
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from catalogue_templates
        ${where}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -1554,14 +1607,21 @@ app.get('/catalogues/templates', async (_req, res) => {
        from catalogue_templates
        ${where}
        order by updated_at desc, template_id asc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) =>
+        normalizeRowJsonFields(
+          {
+            ...row,
+            is_active: Boolean(row.is_active)
+          },
+          ['variables']
+        )
+      ),
       meta: { limit, offset, total, has_more: offset + result.rows.length < total }
     });
   } catch (error) {
@@ -1572,27 +1632,7 @@ app.get('/catalogues/templates', async (_req, res) => {
 app.post('/catalogues/templates', async (req, res) => {
   try {
     const payload = CatalogueTemplateSchema.parse(req.body);
-    await pgClient.query(
-      `insert into catalogue_templates
-        (template_id, channel, subject, body, variables, is_active, updated_at)
-       values ($1, $2, $3, $4, $5, $6, now())
-       on conflict (template_id)
-       do update set
-         channel = excluded.channel,
-         subject = excluded.subject,
-         body = excluded.body,
-         variables = excluded.variables,
-         is_active = excluded.is_active,
-         updated_at = now()`,
-      [
-        payload.template_id,
-        payload.channel,
-        payload.subject,
-        payload.body,
-        payload.variables,
-        payload.is_active
-      ]
-    );
+    await upsertCatalogueRecord('template', payload);
     res.status(200).json({ status: 'ok', template_id: payload.template_id });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
@@ -1609,7 +1649,7 @@ app.put('/catalogues/templates/:templateId', async (req, res) => {
            body = $4,
            variables = $5,
            is_active = $6,
-           updated_at = now()
+           updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where template_id = $1`,
       [
         payload.template_id,
@@ -1657,16 +1697,19 @@ app.get('/catalogues/endpoints', async (_req, res) => {
 
     if (q) {
       values.push(`%${q}%`);
-      where = `where endpoint_id ilike $1 or url ilike $1 or description ilike $1`;
+      where = `where ${caseInsensitiveLike('endpoint_id', 1)} or ${caseInsensitiveLike(
+        'url',
+        1
+      )} or ${caseInsensitiveLike('description', 1)}`;
     }
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from catalogue_endpoints
        ${where}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -1674,14 +1717,22 @@ app.get('/catalogues/endpoints', async (_req, res) => {
        from catalogue_endpoints
        ${where}
        order by updated_at desc, endpoint_id asc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) =>
+        normalizeRowJsonFields(
+          {
+            ...row,
+            timeout_ms: Number(row.timeout_ms || 0),
+            is_active: Boolean(row.is_active)
+          },
+          ['headers']
+        )
+      ),
       meta: { limit, offset, total, has_more: offset + result.rows.length < total }
     });
   } catch (error) {
@@ -1692,29 +1743,7 @@ app.get('/catalogues/endpoints', async (_req, res) => {
 app.post('/catalogues/endpoints', async (req, res) => {
   try {
     const payload = CatalogueEndpointSchema.parse(req.body);
-    await pgClient.query(
-      `insert into catalogue_endpoints
-        (endpoint_id, method, url, headers, timeout_ms, description, is_active, updated_at)
-       values ($1, $2, $3, $4, $5, $6, $7, now())
-       on conflict (endpoint_id)
-       do update set
-         method = excluded.method,
-         url = excluded.url,
-         headers = excluded.headers,
-         timeout_ms = excluded.timeout_ms,
-         description = excluded.description,
-         is_active = excluded.is_active,
-         updated_at = now()`,
-      [
-        payload.endpoint_id,
-        payload.method,
-        payload.url,
-        payload.headers,
-        payload.timeout_ms,
-        payload.description,
-        payload.is_active
-      ]
-    );
+    await upsertCatalogueRecord('endpoint', payload);
     res.status(200).json({ status: 'ok', endpoint_id: payload.endpoint_id });
   } catch (error) {
     res.status(400).json({ status: 'error', message: error.message });
@@ -1732,7 +1761,7 @@ app.put('/catalogues/endpoints/:endpointId', async (req, res) => {
            timeout_ms = $5,
            description = $6,
            is_active = $7,
-           updated_at = now()
+           updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where endpoint_id = $1`,
       [
         payload.endpoint_id,
@@ -1774,15 +1803,8 @@ app.delete('/catalogues/endpoints/:endpointId', async (req, res) => {
 app.post('/ingest', async (req, res) => {
   try {
     const event = normalizeEvent(req.body);
-
-    const insertResult = await pgClient.query(
-      `insert into events (event_id, customer_id, event_type, ts, payload, source)
-       values ($1, $2, $3, $4, $5, $6)
-       on conflict (event_id) do nothing
-       returning event_id`,
-      [event.event_id, event.customer_id, event.event_type, event.ts, event.payload, event.source]
-    );
-    const isDuplicate = insertResult.rowCount === 0;
+    const inserted = await insertEventIfAbsent(event);
+    const isDuplicate = !inserted;
 
     if (isDuplicate) {
       res.status(200).json({
@@ -1816,7 +1838,7 @@ app.post('/journeys', async (req, res) => {
         `select state
          from journey_approvals
          where journey_id = $1 and journey_version = $2
-         limit 1`,
+         ${oneRowClause()}`,
         [input.journey_id, input.version]
       );
       const state = String(approval.rows[0]?.state || '');
@@ -1828,24 +1850,8 @@ app.post('/journeys', async (req, res) => {
         return;
       }
     }
-    await pgClient.query(
-      `insert into journey_folders (folder_path)
-       values ($1)
-       on conflict (folder_path) do nothing`,
-      [input.folder_path]
-    );
-    await pgClient.query(
-      `insert into journeys (journey_id, version, name, status, folder_path, graph_json)
-       values ($1, $2, $3, $4, $5, $6)
-       on conflict (journey_id, version)
-       do update set
-         name = excluded.name,
-         status = excluded.status,
-         folder_path = excluded.folder_path,
-         graph_json = excluded.graph_json,
-         updated_at = now()`,
-      [input.journey_id, input.version, input.name, input.status, input.folder_path, input.graph_json]
-    );
+    await ensureFolderExists(input.folder_path);
+    await upsertJourney(input);
 
     res.status(200).json({ status: 'ok', journey_id: input.journey_id, version: input.version });
   } catch (error) {
@@ -1862,7 +1868,7 @@ app.get('/journeys/:journeyId/approval', async (req, res) => {
               reviewed_by, reviewed_note, reviewed_at, updated_at
        from journey_approvals
        where journey_id = $1 and journey_version = $2
-       limit 1`,
+       ${oneRowClause()}`,
       [journeyId, version]
     );
     res.status(200).json({
@@ -1895,7 +1901,7 @@ app.post('/journeys/:journeyId/request-approval', async (req, res) => {
       `select 1
        from journeys
        where journey_id = $1 and version = $2
-       limit 1`,
+       ${oneRowClause()}`,
       [journeyId, version]
     );
     if (exists.rowCount === 0) {
@@ -1903,26 +1909,17 @@ app.post('/journeys/:journeyId/request-approval', async (req, res) => {
       return;
     }
 
-    await pgClient.query(
-      `insert into journey_approvals
-        (journey_id, journey_version, state, requested_by, requested_note, requested_at, updated_at)
-       values ($1, $2, 'pending', $3, $4, now(), now())
-       on conflict (journey_id, journey_version)
-       do update set
-         state = 'pending',
-         requested_by = excluded.requested_by,
-         requested_note = excluded.requested_note,
-         requested_at = now(),
-         reviewed_by = null,
-         reviewed_note = '',
-         reviewed_at = null,
-         updated_at = now()`,
-      [journeyId, version, payload.requested_by, payload.note || '']
-    );
+    await upsertJourneyApproval({
+      journeyId,
+      version,
+      state: 'pending',
+      requestedBy: payload.requested_by,
+      requestedNote: payload.note || ''
+    });
 
     await pgClient.query(
       `update journeys
-       set status = 'draft', updated_at = now()
+       set status = 'draft', updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where journey_id = $1 and version = $2`,
       [journeyId, version]
     );
@@ -1942,23 +1939,17 @@ app.post('/journeys/:journeyId/approve', async (req, res) => {
     const payload = JourneyApprovalDecisionSchema.parse(req.body || {});
     const version = await resolveJourneyVersion(journeyId, payload.version);
 
-    await pgClient.query(
-      `insert into journey_approvals
-        (journey_id, journey_version, state, reviewed_by, reviewed_note, reviewed_at, updated_at)
-       values ($1, $2, 'approved', $3, $4, now(), now())
-       on conflict (journey_id, journey_version)
-       do update set
-         state = 'approved',
-         reviewed_by = excluded.reviewed_by,
-         reviewed_note = excluded.reviewed_note,
-         reviewed_at = now(),
-         updated_at = now()`,
-      [journeyId, version, payload.reviewed_by, payload.note || '']
-    );
+    await upsertJourneyApproval({
+      journeyId,
+      version,
+      state: 'approved',
+      reviewedBy: payload.reviewed_by,
+      reviewedNote: payload.note || ''
+    });
 
     await pgClient.query(
       `update journeys
-       set status = 'published', updated_at = now()
+       set status = 'published', updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where journey_id = $1 and version = $2`,
       [journeyId, version]
     );
@@ -1978,23 +1969,17 @@ app.post('/journeys/:journeyId/reject', async (req, res) => {
     const payload = JourneyApprovalDecisionSchema.parse(req.body || {});
     const version = await resolveJourneyVersion(journeyId, payload.version);
 
-    await pgClient.query(
-      `insert into journey_approvals
-        (journey_id, journey_version, state, reviewed_by, reviewed_note, reviewed_at, updated_at)
-       values ($1, $2, 'rejected', $3, $4, now(), now())
-       on conflict (journey_id, journey_version)
-       do update set
-         state = 'rejected',
-         reviewed_by = excluded.reviewed_by,
-         reviewed_note = excluded.reviewed_note,
-         reviewed_at = now(),
-         updated_at = now()`,
-      [journeyId, version, payload.reviewed_by, payload.note || '']
-    );
+    await upsertJourneyApproval({
+      journeyId,
+      version,
+      state: 'rejected',
+      reviewedBy: payload.reviewed_by,
+      reviewedNote: payload.note || ''
+    });
 
     await pgClient.query(
       `update journeys
-       set status = 'draft', updated_at = now()
+       set status = 'draft', updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
        where journey_id = $1 and version = $2`,
       [journeyId, version]
     );
@@ -2139,18 +2124,18 @@ app.get('/journeys', async (_req, res) => {
 
     if (journeyId) {
       values.push(`%${journeyId}%`);
-      conditions.push(`journey_id ilike $${values.length}`);
+      conditions.push(`${caseInsensitiveLike('journey_id', values.length)}`);
     }
 
     const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from journeys
        ${whereClause}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -2158,14 +2143,21 @@ app.get('/journeys', async (_req, res) => {
        from journeys
        ${whereClause}
        order by ${sortBy} ${sortOrder}, version desc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) =>
+        normalizeRowJsonFields(
+          {
+            ...row,
+            version: Number(row.version || 0)
+          },
+          ['graph_json']
+        )
+      ),
       meta: {
         limit,
         offset,
@@ -2199,12 +2191,7 @@ app.post('/journey-folders', async (req, res) => {
       return;
     }
 
-    await pgClient.query(
-      `insert into journey_folders (folder_path)
-       values ($1)
-       on conflict (folder_path) do nothing`,
-      [folderPath]
-    );
+    await ensureFolderExists(folderPath);
 
     res.status(201).json({ status: 'ok', folder_path: folderPath });
   } catch (error) {
@@ -2283,7 +2270,7 @@ app.post('/journeys/:journeyId/clone-version', async (req, res) => {
       `select journey_id, version, name, folder_path, graph_json
        from journeys
        where journey_id = $1 and version = $2
-       limit 1`,
+       ${oneRowClause()}`,
       [journeyId, payload.source_version]
     );
 
@@ -2295,7 +2282,7 @@ app.post('/journeys/:journeyId/clone-version', async (req, res) => {
     let targetVersion = payload.target_version;
     if (!targetVersion) {
       const maxVersion = await pgClient.query(
-        `select coalesce(max(version), 0)::int as max_version
+        `select coalesce(max(version), 0) as max_version
          from journeys
          where journey_id = $1`,
         [journeyId]
@@ -2303,24 +2290,19 @@ app.post('/journeys/:journeyId/clone-version', async (req, res) => {
       targetVersion = (maxVersion.rows[0]?.max_version || 0) + 1;
     }
 
-    await pgClient.query(
-      `insert into journey_folders (folder_path)
-       values ($1)
-       on conflict (folder_path) do nothing`,
-      [source.rows[0].folder_path || 'Workspace']
-    );
+    await ensureFolderExists(source.rows[0].folder_path || 'Workspace');
 
     const targetName = payload.name || source.rows[0].name;
     await pgClient.query(
-      `insert into journeys (journey_id, version, name, status, folder_path, graph_json)
-       values ($1, $2, $3, $4, $5, $6)`,
+      `insert into journeys (journey_id, version, name, status, folder_path, graph_json${isOracle ? ', created_at, updated_at' : ''})
+       values ($1, $2, $3, $4, $5, $6${isOracle ? ', current_timestamp, current_timestamp' : ''})`,
       [
         journeyId,
         targetVersion,
         targetName,
         payload.status,
         source.rows[0].folder_path || 'Workspace',
-        source.rows[0].graph_json
+        isOracle ? JSON.stringify(normalizeJsonField(source.rows[0].graph_json, {})) : source.rows[0].graph_json
       ]
     );
 
@@ -2349,23 +2331,18 @@ app.patch('/journeys/:journeyId/move-folder', async (req, res) => {
     const payload = JourneyMoveFolderSchema.parse(req.body);
     const folderPath = payload.target_folder_path.trim();
 
-    await pgClient.query(
-      `insert into journey_folders (folder_path)
-       values ($1)
-       on conflict (folder_path) do nothing`,
-      [folderPath]
-    );
+    await ensureFolderExists(folderPath);
 
     const result = payload.version
       ? await pgClient.query(
           `update journeys
-           set folder_path = $1, updated_at = now()
+           set folder_path = $1, updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
            where journey_id = $2 and version = $3`,
           [folderPath, journeyId, payload.version]
         )
       : await pgClient.query(
           `update journeys
-           set folder_path = $1, updated_at = now()
+           set folder_path = $1, updated_at = ${isOracle ? 'current_timestamp' : 'now()'}
            where journey_id = $2`,
           [folderPath, journeyId]
         );
@@ -2394,8 +2371,8 @@ app.post('/customers', async (req, res) => {
     const payload = CustomerCreateSchema.parse(req.body);
     await pgClient.query(
       `insert into customer_profiles (customer_id, segment, attributes, updated_at)
-       values ($1, $2, $3, now())`,
-      [payload.customer_id, payload.segment ?? null, payload.attributes]
+       values ($1, $2, $3, ${isOracle ? 'current_timestamp' : 'now()'})`,
+      [payload.customer_id, payload.segment ?? null, isOracle ? JSON.stringify(payload.attributes) : payload.attributes]
     );
 
     res.status(201).json({ status: 'ok', customer_id: payload.customer_id });
@@ -2416,16 +2393,7 @@ app.put('/customers/:customerId/profile', async (req, res) => {
     const customerId = req.params.customerId;
     const payload = CustomerProfileSchema.parse(req.body);
 
-    await pgClient.query(
-      `insert into customer_profiles (customer_id, segment, attributes, updated_at)
-       values ($1, $2, $3, now())
-       on conflict (customer_id)
-       do update set
-         segment = excluded.segment,
-         attributes = excluded.attributes,
-         updated_at = now()`,
-      [customerId, payload.segment ?? null, payload.attributes]
-    );
+    await upsertCustomerProfile(customerId, payload);
 
     res.status(200).json({ status: 'ok', customer_id: customerId });
   } catch (error) {
@@ -2448,7 +2416,10 @@ app.get('/customers/:customerId/profile', async (req, res) => {
       return;
     }
 
-    res.status(200).json({ status: 'ok', item: result.rows[0] });
+    res.status(200).json({
+      status: 'ok',
+      item: normalizeRowJsonFields(result.rows[0], ['attributes'])
+    });
   } catch (error) {
     res.status(500).json({ status: 'error', message: error.message });
   }
@@ -2470,17 +2441,17 @@ app.get('/customers', async (req, res) => {
     }
     if (q) {
       values.push(`%${q}%`);
-      conditions.push(`customer_id ilike $${values.length}`);
+      conditions.push(`${caseInsensitiveLike('customer_id', values.length)}`);
     }
     const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from customer_profiles
        ${whereClause}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -2488,14 +2459,13 @@ app.get('/customers', async (req, res) => {
        from customer_profiles
        ${whereClause}
        order by updated_at ${sortOrder}
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) => normalizeRowJsonFields(row, ['attributes'])),
       meta: {
         limit,
         offset,
@@ -2540,12 +2510,12 @@ app.get('/actions', async (req, res) => {
     const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from action_log
        ${whereClause}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -2554,8 +2524,7 @@ app.get('/actions', async (req, res) => {
        from action_log
        ${whereClause}
        order by created_at ${sortOrder}
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
@@ -2607,12 +2576,12 @@ app.get('/external-calls', async (req, res) => {
     const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from external_call_log
        ${whereClause}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -2621,14 +2590,13 @@ app.get('/external-calls', async (req, res) => {
        from external_call_log
        ${whereClause}
        order by created_at ${sortOrder}
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) => normalizeRowJsonFields(row, ['response_json'])),
       meta: {
         limit,
         offset,
@@ -2645,27 +2613,27 @@ app.get('/journey-instances', async (req, res) => {
   try {
     const customerId = req.query.customer_id?.toString();
     const limit = Math.min(Number(req.query.limit || 50), 200);
+    const values = [];
+    let whereClause = '';
+    if (customerId) {
+      values.push(customerId);
+      whereClause = `where customer_id = $${values.length}`;
+    }
+    const listValues = [...values, limit, 0];
+    const result = await pgClient.query(
+      `select instance_id, journey_id, journey_version, customer_id, state, current_node,
+              started_at, due_at, completed_at, last_event_id, context_json, updated_at
+       from journey_instances
+       ${whereClause}
+       order by updated_at desc
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
+      listValues
+    );
 
-    const result = customerId
-      ? await pgClient.query(
-          `select instance_id, journey_id, journey_version, customer_id, state, current_node,
-                  started_at, due_at, completed_at, last_event_id, context_json, updated_at
-           from journey_instances
-           where customer_id = $1
-           order by updated_at desc
-           limit $2`,
-          [customerId, limit]
-        )
-      : await pgClient.query(
-          `select instance_id, journey_id, journey_version, customer_id, state, current_node,
-                  started_at, due_at, completed_at, last_event_id, context_json, updated_at
-           from journey_instances
-           order by updated_at desc
-           limit $1`,
-          [limit]
-        );
-
-    res.status(200).json({ status: 'ok', items: result.rows });
+    res.status(200).json({
+      status: 'ok',
+      items: result.rows.map((row) => normalizeRowJsonFields(row, ['context_json']))
+    });
   } catch (error) {
     res.status(500).json({ status: 'error', message: error.message });
   }
@@ -2696,12 +2664,12 @@ app.get('/journey-instance-transitions', async (req, res) => {
     const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from journey_instance_transitions
        ${whereClause}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -2710,14 +2678,13 @@ app.get('/journey-instance-transitions', async (req, res) => {
        from journey_instance_transitions
        ${whereClause}
        order by created_at desc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) => normalizeRowJsonFields(row, ['metadata_json'])),
       meta: {
         limit,
         offset,
@@ -2743,7 +2710,7 @@ app.get('/manual-wait-queue', async (req, res) => {
     const offset = parseOffset(req.query.offset);
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from journey_instances
        where journey_id = $1
          and journey_version = $2
@@ -2751,7 +2718,7 @@ app.get('/manual-wait-queue', async (req, res) => {
          and current_node = $3`,
       [journeyId, version, waitNodeId]
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const result = await pgClient.query(
       `select instance_id, customer_id, state, current_node, started_at, due_at, updated_at, context_json
@@ -2761,8 +2728,7 @@ app.get('/manual-wait-queue', async (req, res) => {
          and state = 'waiting_manual'
          and current_node = $3
        order by started_at asc
-       limit $4
-       offset $5`,
+       ${paginationClause(4, 5)}`,
       [journeyId, version, waitNodeId, limit, offset]
     );
 
@@ -2771,7 +2737,7 @@ app.get('/manual-wait-queue', async (req, res) => {
       journey_id: journeyId,
       journey_version: version,
       wait_node_id: waitNodeId,
-      items: result.rows,
+      items: result.rows.map((row) => normalizeRowJsonFields(row, ['context_json'])),
       meta: { limit, offset, total, has_more: offset + result.rows.length < total }
     });
   } catch (error) {
@@ -2786,38 +2752,47 @@ app.post('/manual-wait-release', async (req, res) => {
     const waitNodeId = await resolveWaitNodeId(payload.journey_id, version, payload.wait_node_id);
 
     await pgClient.query('begin');
-    const released = await pgClient.query(
-      `with picked as (
-         select instance_id
-         from journey_instances
-         where journey_id = $1
-           and journey_version = $2
-           and state = 'waiting_manual'
-           and current_node = $3
-         order by started_at asc
-         limit $4
-         for update skip locked
-       )
-       update journey_instances ji
-       set state = 'waiting',
-           due_at = now(),
-           updated_at = now(),
-           context_json = ji.context_json || $5::jsonb
-       from picked
-       where ji.instance_id = picked.instance_id
-       returning ji.instance_id, ji.customer_id, ji.last_event_id`,
-      [
-        payload.journey_id,
-        version,
-        waitNodeId,
-        payload.count,
-        JSON.stringify({
-          manual_release_at: new Date().toISOString(),
-          manual_release_by: payload.released_by || 'ui',
-          manual_release_count: payload.count
-        })
-      ]
+    let released;
+    const releaseContext = {
+      manual_release_at: new Date().toISOString(),
+      manual_release_by: payload.released_by || 'ui',
+      manual_release_count: payload.count
+    };
+
+    const picked = await pgClient.query(
+      `select instance_id, customer_id, last_event_id
+       from journey_instances
+       where journey_id = $1
+         and journey_version = $2
+         and state = 'waiting_manual'
+         and current_node = $3
+       order by started_at asc
+       ${oracleFetchRowsClause(payload.count)}`,
+      [payload.journey_id, version, waitNodeId]
     );
+    released = { rows: picked.rows, rowCount: picked.rows.length };
+    for (const item of picked.rows) {
+      const current = await pgClient.query(
+        `select context_json
+         from journey_instances
+         where instance_id = $1
+         ${oneRowClause()}`,
+        [item.instance_id]
+      );
+      const mergedContext = {
+        ...normalizeJsonField(current.rows[0]?.context_json, {}),
+        ...releaseContext
+      };
+      await pgClient.query(
+        `update journey_instances
+         set state = 'waiting',
+             due_at = current_timestamp,
+             updated_at = current_timestamp,
+             context_json = $2
+         where instance_id = $1`,
+        [item.instance_id, JSON.stringify(mergedContext)]
+      );
+    }
 
     for (const item of released.rows) {
       await pgClient.query(
@@ -2837,10 +2812,15 @@ app.post('/manual-wait-release', async (req, res) => {
           waitNodeId,
           'manual_release',
           item.last_event_id || null,
-          {
-            released_by: payload.released_by || 'ui',
-            requested_count: payload.count
-          }
+          isOracle
+            ? JSON.stringify({
+                released_by: payload.released_by || 'ui',
+                requested_count: payload.count
+              })
+            : {
+                released_by: payload.released_by || 'ui',
+                requested_count: payload.count
+              }
         ]
       );
     }
@@ -2867,13 +2847,12 @@ app.get('/dlq-events', async (req, res) => {
       `select id, event_id, customer_id, event_type, source_topic, error_message, raw_payload, created_at
        from event_dlq
        order by created_at desc
-       limit $1
-       offset $2`,
+       ${paginationClause(1, 2)}`,
       [limit, offset]
     );
     res.status(200).json({
       status: 'ok',
-      items: result.rows,
+      items: result.rows.map((row) => normalizeRowJsonFields(row, ['raw_payload'])),
       meta: { limit, offset, has_more: result.rows.length === limit }
     });
   } catch (error) {
@@ -2906,12 +2885,12 @@ app.get('/edge-capacity-usage', async (req, res) => {
     const whereClause = conditions.length > 0 ? `where ${conditions.join(' and ')}` : '';
 
     const countResult = await pgClient.query(
-      `select count(*)::int as total
+      `select count(*) as total
        from edge_capacity_usage
        ${whereClause}`,
       values
     );
-    const total = countResult.rows[0]?.total || 0;
+    const total = Number(countResult.rows[0]?.total || 0);
 
     const listValues = [...values, limit, offset];
     const result = await pgClient.query(
@@ -2919,8 +2898,7 @@ app.get('/edge-capacity-usage', async (req, res) => {
        from edge_capacity_usage
        ${whereClause}
        order by updated_at desc
-       limit $${listValues.length - 1}
-       offset $${listValues.length}`,
+       ${paginationClause(listValues.length - 1, listValues.length)}`,
       listValues
     );
 

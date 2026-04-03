@@ -5,9 +5,11 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
-import pg from 'pg';
+import oracledb from 'oracledb';
 import { createClient } from 'redis';
 import { z } from 'zod';
+import { describeDatabaseTarget, resolveCacheLoaderMetadataConfig } from '../../../lib/database-config.mjs';
+import { createDatabaseClient } from '../../../lib/database-runtime.mjs';
 
 dotenv.config({ path: '../../.env' });
 
@@ -20,19 +22,41 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.resolve(__dirname, '../public');
 
 const port = Number(process.env.CACHE_LOADER_PORT || 3010);
-const metadataDbUrl =
-  process.env.CACHE_LOADER_METADATA_DB_URL ||
-  process.env.POSTGRES_URL ||
-  'postgresql://eventra:eventra@localhost:5432/eventra';
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+const metadataDb = resolveCacheLoaderMetadataConfig();
+const isOracle = metadataDb.vendor === 'oracle';
+
+console.info(
+  `[bootstrap] cache-loader metadata database vendor=${metadataDb.vendor} target=${describeDatabaseTarget(
+    metadataDb
+  )}`
+);
 
 let metadataPg = null;
 const redis = createClient({ url: redisUrl });
 
 const schedules = new Map();
 
+oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
+
 function createMetadataPgClient() {
-  return new pg.Client({ connectionString: metadataDbUrl });
+  return createDatabaseClient(metadataDb);
+}
+
+function oneRowClause() {
+  return 'fetch first 1 rows only';
+}
+
+function currentTimestampExpr() {
+  return 'current_timestamp';
+}
+
+function toDbBoolean(value) {
+  return value ? 1 : 0;
+}
+
+function normalizeDbBoolean(value) {
+  return Number(value || 0) === 1;
 }
 
 function sleep(ms) {
@@ -57,9 +81,10 @@ async function withRetry(label, fn, attempts = 20, delayMs = 3000) {
 }
 
 const ConnectionSchema = z.object({
+  driver: z.literal('oracle').default('oracle'),
   name: z.string().min(1),
   host: z.string().min(1),
-  port: z.number().int().min(1).max(65535).default(5432),
+  port: z.number().int().min(1).max(65535).default(1521),
   database: z.string().min(1),
   username: z.string().min(1),
   password: z.string().min(1),
@@ -113,103 +138,78 @@ function inferValueType(value) {
   return 'string';
 }
 
+function buildOracleSourceConnectString(connection) {
+  return `${connection.host}:${Number(connection.port)}/${connection.database_name}`;
+}
+
+function createSourceQueryClient(connection) {
+  let conn = null;
+  return {
+    async connect() {
+      conn = await oracledb.getConnection({
+        user: connection.username,
+        password: connection.password,
+        connectString: buildOracleSourceConnectString(connection)
+      });
+    },
+    async query(sql) {
+      if (!conn) {
+        throw new Error('oracle source connection not initialized');
+      }
+      const result = await conn.execute(String(sql), {}, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      return { rows: result.rows || [] };
+    },
+    async end() {
+      if (conn) {
+        await conn.close();
+        conn = null;
+      }
+    }
+  };
+}
+
 async function ensureSchema() {
-  await metadataPg.query(`
-    create table if not exists cache_loader_connections (
-      id uuid primary key,
-      name text not null,
-      host text not null,
-      port int not null,
-      database_name text not null,
-      username text not null,
-      password text not null,
-      ssl_enabled boolean not null default false,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await metadataPg.query(`
-    create table if not exists cache_loader_jobs (
-      id uuid primary key,
-      name text not null,
-      connection_id uuid not null references cache_loader_connections(id) on delete cascade,
-      dataset_key text not null,
-      sql_query text not null,
-      key_column text not null,
-      run_time text not null,
-      timezone text not null,
-      enabled boolean not null default true,
-      last_run_at timestamptz,
-      last_status text,
-      last_error text,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-
-  await metadataPg.query(`
-    create table if not exists cache_loader_runs (
-      id uuid primary key,
-      job_id uuid not null references cache_loader_jobs(id) on delete cascade,
-      started_at timestamptz not null,
-      finished_at timestamptz,
-      status text not null,
-      row_count int not null default 0,
-      error_text text
-    )
-  `);
+  return;
 }
 
 async function getConnectionById(connectionId) {
   const result = await metadataPg.query(
-    `select id, name, host, port, database_name, username, password, ssl_enabled
+    `select id, driver, name, host, port, database_name, username, password, ssl_enabled
      from cache_loader_connections
      where id = $1
-     limit 1`,
+     ${oneRowClause()}`,
     [connectionId]
   );
   if (result.rowCount === 0) {
     throw new Error('connection not found');
   }
-  return result.rows[0];
+  return {
+    ...result.rows[0],
+    ssl_enabled: normalizeDbBoolean(result.rows[0]?.ssl_enabled)
+  };
 }
 
 async function runSelectPreview({ connection, sqlQuery, previewLimit }) {
-  const sourceClient = new pg.Client({
-    host: connection.host,
-    port: Number(connection.port),
-    database: connection.database_name,
-    user: connection.username,
-    password: connection.password,
-    ssl: connection.ssl_enabled ? { rejectUnauthorized: false } : undefined
-  });
+  const sourceClient = createSourceQueryClient(connection);
 
   try {
     await sourceClient.connect();
-    const query = `select * from (${sqlQuery}) as q limit ${Math.max(1, Number(previewLimit) || 20)}`;
+    const query = `select * from (${sqlQuery}) q where rownum <= ${Math.max(1, Number(previewLimit) || 20)}`;
     const result = await sourceClient.query(query);
     return result.rows || [];
   } finally {
-    await sourceClient.end().catch(() => {});
+    await sourceClient.end();
   }
 }
 
 async function testConnection(connection) {
-  const sourceClient = new pg.Client({
-    host: connection.host,
-    port: Number(connection.port),
-    database: connection.database_name,
-    user: connection.username,
-    password: connection.password,
-    ssl: connection.ssl_enabled ? { rejectUnauthorized: false } : undefined
-  });
+  const sourceClient = createSourceQueryClient(connection);
 
   const startedAt = Date.now();
   try {
     await sourceClient.connect();
     const probe = await sourceClient.query(
-      `select current_database() as database_name, now() as server_now`
+      `select sys_context('USERENV', 'DB_NAME') as database_name, current_timestamp as server_now from dual`
     );
     const elapsedMs = Date.now() - startedAt;
     return {
@@ -219,7 +219,7 @@ async function testConnection(connection) {
       server_now: probe.rows[0]?.server_now || null
     };
   } finally {
-    await sourceClient.end().catch(() => {});
+    await sourceClient.end();
   }
 }
 
@@ -228,7 +228,7 @@ async function runJob(jobId, trigger = 'scheduler') {
     `select id, name, connection_id, dataset_key, sql_query, key_column, run_time, timezone, enabled
      from cache_loader_jobs
      where id = $1
-     limit 1`,
+     ${oneRowClause()}`,
     [jobId]
   );
 
@@ -246,19 +246,12 @@ async function runJob(jobId, trigger = 'scheduler') {
   const runId = crypto.randomUUID();
   await metadataPg.query(
     `insert into cache_loader_runs (id, job_id, started_at, status)
-     values ($1, $2, now(), 'running')`,
+     values ($1, $2, ${currentTimestampExpr()}, 'running')`,
     [runId, jobId]
   );
 
   const sourceConn = await getConnectionById(job.connection_id);
-  const sourceClient = new pg.Client({
-    host: sourceConn.host,
-    port: Number(sourceConn.port),
-    database: sourceConn.database_name,
-    user: sourceConn.username,
-    password: sourceConn.password,
-    ssl: sourceConn.ssl_enabled ? { rejectUnauthorized: false } : undefined
-  });
+  const sourceClient = createSourceQueryClient(sourceConn);
 
   try {
     await sourceClient.connect();
@@ -313,17 +306,17 @@ async function runJob(jobId, trigger = 'scheduler') {
 
     await metadataPg.query(
       `update cache_loader_runs
-       set finished_at = now(), status = 'success', row_count = $2
+       set finished_at = ${currentTimestampExpr()}, status = 'success', row_count = $2
        where id = $1`,
       [runId, rows.length]
     );
 
     await metadataPg.query(
       `update cache_loader_jobs
-       set last_run_at = now(),
+       set last_run_at = ${currentTimestampExpr()},
            last_status = 'success',
            last_error = null,
-           updated_at = now()
+           updated_at = ${currentTimestampExpr()}
        where id = $1`,
       [job.id]
     );
@@ -332,24 +325,24 @@ async function runJob(jobId, trigger = 'scheduler') {
   } catch (error) {
     await metadataPg.query(
       `update cache_loader_runs
-       set finished_at = now(), status = 'failed', error_text = $2
+       set finished_at = ${currentTimestampExpr()}, status = 'failed', error_text = $2
        where id = $1`,
       [runId, String(error.message || error)]
     );
 
     await metadataPg.query(
       `update cache_loader_jobs
-       set last_run_at = now(),
+       set last_run_at = ${currentTimestampExpr()},
            last_status = 'failed',
            last_error = $2,
-           updated_at = now()
+           updated_at = ${currentTimestampExpr()}
        where id = $1`,
       [job.id, String(error.message || error)]
     );
 
     throw error;
   } finally {
-    await sourceClient.end().catch(() => {});
+    await sourceClient.end();
   }
 }
 
@@ -411,11 +404,14 @@ app.get('/health', async (_req, res) => {
 
 app.get('/connections', async (_req, res) => {
   const result = await metadataPg.query(
-    `select id, name, host, port, database_name, username, ssl_enabled, created_at, updated_at
+    `select id, driver, name, host, port, database_name, username, ssl_enabled, created_at, updated_at
      from cache_loader_connections
      order by created_at desc`
   );
-  res.status(200).json({ status: 'ok', items: result.rows });
+  res.status(200).json({
+    status: 'ok',
+    items: result.rows.map((row) => ({ ...row, ssl_enabled: normalizeDbBoolean(row.ssl_enabled) }))
+  });
 });
 
 app.post('/connections', async (req, res) => {
@@ -424,17 +420,18 @@ app.post('/connections', async (req, res) => {
     const id = crypto.randomUUID();
     await metadataPg.query(
       `insert into cache_loader_connections
-        (id, name, host, port, database_name, username, password, ssl_enabled)
-       values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       (id, driver, name, host, port, database_name, username, password, ssl_enabled)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         id,
+        payload.driver,
         payload.name,
         payload.host,
         payload.port,
         payload.database,
         payload.username,
         payload.password,
-        payload.ssl
+        toDbBoolean(payload.ssl)
       ]
     );
     res.status(201).json({ status: 'ok', id });
@@ -474,7 +471,10 @@ app.get('/jobs', async (_req, res) => {
      join cache_loader_connections c on c.id = j.connection_id
      order by j.created_at desc`
   );
-  res.status(200).json({ status: 'ok', items: result.rows });
+  res.status(200).json({
+    status: 'ok',
+    items: result.rows.map((row) => ({ ...row, enabled: normalizeDbBoolean(row.enabled) }))
+  });
 });
 
 app.post('/jobs', async (req, res) => {
@@ -496,7 +496,7 @@ app.post('/jobs', async (req, res) => {
         payload.key_column,
         payload.run_time,
         payload.timezone,
-        payload.enabled
+        toDbBoolean(payload.enabled)
       ]
     );
 
@@ -550,7 +550,7 @@ app.put('/jobs/:id', async (req, res) => {
            run_time = $7,
            timezone = $8,
            enabled = $9,
-           updated_at = now()
+           updated_at = ${currentTimestampExpr()}
        where id = $1`,
       [
         req.params.id,
@@ -561,7 +561,7 @@ app.put('/jobs/:id', async (req, res) => {
         payload.key_column,
         payload.run_time,
         payload.timezone,
-        payload.enabled
+        toDbBoolean(payload.enabled)
       ]
     );
 
@@ -616,7 +616,7 @@ app.get('/runs', async (req, res) => {
      join cache_loader_jobs j on j.id = r.job_id
      ${where}
      order by r.started_at desc
-     limit 200`,
+     fetch first 200 rows only`,
     values
   );
 
@@ -626,7 +626,7 @@ app.get('/runs', async (req, res) => {
 app.use('/', express.static(publicDir));
 
 async function start() {
-  await withRetry('postgres connect', async () => {
+  await withRetry('database connect', async () => {
     const client = createMetadataPgClient();
     try {
       await client.connect();
@@ -637,7 +637,9 @@ async function start() {
     }
   });
   await withRetry('redis connect', () => redis.connect());
-  await ensureSchema();
+  console.warn(
+    '[cache-loader] automatic metadata schema bootstrap is skipped for Oracle. Apply Oracle DDL manually before serving traffic.'
+  );
   await refreshSchedules();
 
   app.listen(port, () => {

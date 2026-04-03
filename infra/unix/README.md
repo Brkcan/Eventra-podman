@@ -2,13 +2,25 @@
 
 Bu dizin, Eventra'yi Docker/Podman kullanmadan klasik Unix sunucuda ayri servisler olarak calistirmak icin gereken iskeleti icerir.
 
+Not:
+- Bu dokuman sunucu/production icindir.
+- Local test icin Docker kullanim iskeleti root README'de ve [infra/docker/docker-compose.local.yml](/Users/burakcan/Eventra-podman/infra/docker/docker-compose.local.yml) dosyasinda bulunur.
+
+Oracle gecis notu:
+- Hedef ana veritabani Oracle'dir.
+- Env ve deploy dokumani Oracle merkezli hale getirildi.
+- Ayrintili gecis plani: [ORACLE_MIGRATION.md](ORACLE_MIGRATION.md)
+- Oracle tablo scriptleri: [oracle-schema.sql](oracle-schema.sql)
+- Oracle smoke test scripti: [oracle-smoke-test.sql](oracle-smoke-test.sql)
+- Oracle smoke wrapper: [run-oracle-smoke.sh](run-oracle-smoke.sh)
+
 Hedef yapi:
 
 - `api` -> `systemd` servisi
 - `rule-engine` -> `systemd` servisi
 - `cache-loader` -> `systemd` servisi
 - `frontend` -> `vite build` sonucu static dosya, `caddy` ile servis edilir
-- `postgres`, `redis`, `kafka` -> host servisleri
+- `oracle`, `redis`, `kafka` -> host servisleri
 
 ## Onerilen dizin yapisi
 
@@ -27,7 +39,7 @@ Ubuntu/Debian:
 
 ```bash
 apt-get update
-apt-get install -y curl git build-essential caddy redis-server postgresql
+apt-get install -y curl git build-essential caddy redis-server
 ```
 
 Node 20:
@@ -61,13 +73,27 @@ Asagidaki alanlari host adreslerine gore duzenle:
 
 ```bash
 KAFKA_BROKERS=127.0.0.1:9092
-POSTGRES_URL=postgresql://eventra:eventra@127.0.0.1:5432/eventra
+DB_VENDOR=oracle
+ORACLE_USER=eventra
+ORACLE_PASSWORD=secret
+ORACLE_CONNECT_STRING=127.0.0.1:1521/FREEPDB1
 REDIS_URL=redis://127.0.0.1:6379
 PORT=3001
 CACHE_LOADER_PORT=3010
-CACHE_LOADER_METADATA_DB_URL=postgresql://eventra:eventra@127.0.0.1:5432/eventra
+CACHE_LOADER_METADATA_DB_VENDOR=oracle
+CACHE_LOADER_METADATA_ORACLE_USER=eventra
+CACHE_LOADER_METADATA_ORACLE_PASSWORD=secret
+CACHE_LOADER_METADATA_ORACLE_CONNECT_STRING=127.0.0.1:1521/FREEPDB1
 RULE_ENGINE_HEALTH_PORT=3002
 LLM_PROVIDER=mock
+```
+
+Oracle schema yuklemesi:
+
+```bash
+sqlplus eventra/secret@127.0.0.1:1521/FREEPDB1 @infra/unix/oracle-schema.sql
+sqlplus eventra/secret@127.0.0.1:1521/FREEPDB1 @infra/unix/oracle-smoke-test.sql
+ORACLE_USER=eventra ORACLE_PASSWORD=secret ORACLE_CONNECT_STRING=127.0.0.1:1521/FREEPDB1 ./infra/unix/run-oracle-smoke.sh
 ```
 
 Frontend build icin gerekiyorsa:

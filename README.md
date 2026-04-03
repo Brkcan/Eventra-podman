@@ -2,22 +2,26 @@
 
 Bu repo, EVAM benzeri bir urun icin ilk MVP iskeletini kurar.
 
+Not:
+- Uygulama artik container merkezli degil; servisler ayri process/systemd servisleri olarak hedeflenir.
+- Ana veritabani Oracle'dir.
+
 ## Icerik
 
 - Kafka event ingestion
 - API (`apps/api`) ile event alma ve persist etme
 - Basit rule engine (`services/rule-engine`) ile `cart_add -> email action` tetikleme
 - Redis customer son durum cache'i
-- Postgres kalici veri
+- Oracle hedefli kalici veri katmani
 - React Flow journey designer (`apps/frontend`)
 
 ## Local Baslatma
 
-Bu repo artik Docker/Podman merkezli degil. Gelistirme ve deploy akisi, ayri servisler ve host servisleri uzerinden ilerler.
+Local test icin Docker kullanabilirsin. Sunucu tarafi icin hedef hala container'siz `systemd` kurulumdur.
 
-Gerekli host servisleri:
+Docker ile sadece local altyapiyi kaldir:
 
-- PostgreSQL
+- Oracle Database
 - Redis
 - Kafka
 
@@ -33,15 +37,51 @@ npm install
 cp .env.example .env
 ```
 
-3. Host servis adreslerini `.env` icinde duzenle:
+3. `.env` Oracle Docker stack ile uyumlu olsun:
 
 ```bash
 KAFKA_BROKERS=127.0.0.1:9092
-POSTGRES_URL=postgresql://eventra:eventra@127.0.0.1:5432/eventra
+DB_VENDOR=oracle
+ORACLE_USER=eventra
+ORACLE_PASSWORD=secret
+ORACLE_CONNECT_STRING=127.0.0.1:1521/FREEPDB1
 REDIS_URL=redis://127.0.0.1:6379
 ```
 
-4. Servisleri ayri terminallerde calistir:
+4. Local Docker infra'yi kaldir:
+
+```bash
+npm run docker:infra:up
+```
+
+Durum:
+
+```bash
+npm run docker:infra:ps
+```
+
+Log:
+
+```bash
+npm run docker:infra:logs
+```
+
+Kapat:
+
+```bash
+npm run docker:infra:down
+```
+
+5. Oracle schema otomatik olarak `oracle-init` container'i ile uygulanir. Istersen elle smoke test de kos:
+
+```bash
+ORACLE_USER=eventra \
+ORACLE_PASSWORD=secret \
+ORACLE_CONNECT_STRING=127.0.0.1:1521/FREEPDB1 \
+./infra/unix/run-oracle-smoke.sh
+```
+
+6. Uygulama servislerini ayri terminallerde calistir:
 
 ```bash
 npm run dev:api
@@ -64,11 +104,32 @@ curl http://localhost:3002/health
 curl http://localhost:3010/health
 ```
 
+## Local Docker Infra
+
+Lokal Docker compose dosyasi:
+
+- [infra/docker/docker-compose.local.yml](infra/docker/docker-compose.local.yml)
+
+Bu compose yalnizca local test icindir:
+- `oracle`
+- `oracle-init`
+- `redis`
+- `kafka`
+
+Uygulama servisleri yine lokal process olarak calisir:
+- `npm run dev:api`
+- `npm run dev:rule-engine`
+- `npm run dev:cache-loader`
+- `npm run dev:frontend`
+
 ## Unix Deployment (Container'siz)
 
 Docker/Podman kullanmadan klasik Unix sunucuda ayri servisler olarak calistirmak icin hazir iskelet:
 
 - dokuman: [infra/unix/README.md](infra/unix/README.md)
+- Oracle gecis plani: [infra/unix/ORACLE_MIGRATION.md](infra/unix/ORACLE_MIGRATION.md)
+- Oracle schema: [infra/unix/oracle-schema.sql](infra/unix/oracle-schema.sql)
+- Oracle smoke test: [infra/unix/oracle-smoke-test.sql](infra/unix/oracle-smoke-test.sql)
 - `systemd` unitleri:
   - [infra/unix/systemd/eventra-api.service](infra/unix/systemd/eventra-api.service)
   - [infra/unix/systemd/eventra-rule-engine.service](infra/unix/systemd/eventra-rule-engine.service)
@@ -80,7 +141,7 @@ Bu modelde:
 
 - `api`, `rule-engine`, `cache-loader` ayri `systemd` servisleri olarak calisir
 - `frontend` static build olarak `caddy` ile servis edilir
-- `postgres`, `redis`, `kafka` host servisleri olur
+- `oracle`, `redis`, `kafka` host servisleri olur
 
 Bu sayede su komutlar dogrudan mumkun olur:
 
@@ -217,7 +278,7 @@ curl -X PUT http://localhost:3001/customers/cust-123/profile \
 
 Production hedef modeli:
 
-- host uzerinde PostgreSQL / Redis / Kafka
+- host uzerinde Oracle / Redis / Kafka
 - `systemd` ile `api`, `rule-engine`, `cache-loader`
 - `caddy` ile static frontend + API reverse proxy
 

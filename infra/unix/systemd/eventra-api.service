@@ -1,6 +1,6 @@
 [Unit]
 Description=Eventra API
-After=network-online.target postgresql.service redis.service
+After=network-online.target redis.service
 Wants=network-online.target
 
 [Service]
